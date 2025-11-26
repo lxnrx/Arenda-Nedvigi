@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import signal
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -12,7 +13,10 @@ from datetime import datetime
 from typing import Optional
 
 # Настройка логирования
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # Токен бота
@@ -26,6 +30,9 @@ dp = Dispatcher(storage=storage)
 
 # Глобальный пул соединений
 db_pool: Optional[asyncpg.Pool] = None
+
+# Флаг для graceful shutdown
+shutdown_flag = False
 
 # Инициализация базы данных
 async def init_db():
@@ -1401,24 +1408,59 @@ async def podelu_handlers(callback: types.CallbackQuery):
     await callback.answer(messages.get(action, "В разработке"), show_alert=True)
 
 # Запуск бота
+async def on_shutdown():
+    """Graceful shutdown"""
+    logger.info("Shutting down...")
+    if db_pool:
+        await db_pool.close()
+    await bot.session.close()
+
 async def main():
-    await init_db()
-    logger.info("Bot started")
+    global shutdown_flag
     
-    # Запускаем polling в фоне
-    polling_task = asyncio.create_task(dp.start_polling(bot))
+    # Инициализация БД
+    try:
+        await init_db()
+    except Exception as e:
+        logger.error(f"Failed to initialize database: {e}")
+        return
     
-    # Если Railway требует порт, запускаем dummy HTTP сервер
+    logger.info("Bot started successfully")
+    
+    # Настройка graceful shutdown
+    loop = asyncio.get_event_loop()
+    
+    def signal_handler():
+        logger.info("Received shutdown signal")
+        shutdown_flag = True
+    
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, signal_handler)
+    
+    # HTTP сервер для health checks
     port = os.getenv("PORT")
+    http_server = None
+    
     if port:
         from aiohttp import web
         
         async def health_check(request):
             return web.Response(text="Bot is running")
         
+        async def readiness_check(request):
+            # Проверяем подключение к БД
+            try:
+                async with db_pool.acquire() as conn:
+                    await conn.fetchval('SELECT 1')
+                return web.Response(text="Ready", status=200)
+            except Exception as e:
+                logger.error(f"Readiness check failed: {e}")
+                return web.Response(text="Not ready", status=503)
+        
         app = web.Application()
         app.router.add_get("/", health_check)
         app.router.add_get("/health", health_check)
+        app.router.add_get("/ready", readiness_check)
         
         runner = web.AppRunner(app)
         await runner.setup()
@@ -1426,12 +1468,24 @@ async def main():
         
         logger.info(f"Starting health check server on port {port}")
         await site.start()
+        http_server = runner
     
-    # Ждем завершения polling
-    await polling_task
+    # Запуск polling
+    try:
+        await dp.start_polling(
+            bot,
+            allowed_updates=dp.resolve_used_update_types(),
+            drop_pending_updates=True  # Очищаем старые обновления при старте
+        )
+    except Exception as e:
+        logger.error(f"Polling error: {e}")
+    finally:
+        await on_shutdown()
+        if http_server:
+            await http_server.cleanup()
 
 if __name__ == '__main__':
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot stopped")
+        logger.info("Bot stopped by user")
