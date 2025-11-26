@@ -1404,7 +1404,34 @@ async def podelu_handlers(callback: types.CallbackQuery):
 async def main():
     await init_db()
     logger.info("Bot started")
-    await dp.start_polling(bot)
+    
+    # Запускаем polling в фоне
+    polling_task = asyncio.create_task(dp.start_polling(bot))
+    
+    # Если Railway требует порт, запускаем dummy HTTP сервер
+    port = os.getenv("PORT")
+    if port:
+        from aiohttp import web
+        
+        async def health_check(request):
+            return web.Response(text="Bot is running")
+        
+        app = web.Application()
+        app.router.add_get("/", health_check)
+        app.router.add_get("/health", health_check)
+        
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', int(port))
+        
+        logger.info(f"Starting health check server on port {port}")
+        await site.start()
+    
+    # Ждем завершения polling
+    await polling_task
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot stopped")
