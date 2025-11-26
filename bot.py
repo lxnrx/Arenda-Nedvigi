@@ -97,6 +97,20 @@ async def init_db():
             )
         ''')
         
+        # Таблица бронирований
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS bookings (
+                id SERIAL PRIMARY KEY,
+                property_id INTEGER REFERENCES properties(id) ON DELETE CASCADE,
+                guest_name TEXT NOT NULL,
+                checkin_date DATE NOT NULL,
+                checkout_date DATE,
+                access_code TEXT UNIQUE NOT NULL,
+                is_active BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+        
         logger.info("Database initialized successfully")
 
 # Состояния FSM
@@ -112,6 +126,12 @@ class PropertyStates(StatesGroup):
     waiting_property_name = State()
     waiting_property_address = State()
     editing_field = State()
+    adding_custom_button_name = State()
+    adding_custom_button_content = State()
+
+class BookingStates(StatesGroup):
+    waiting_guest_name = State()
+    waiting_checkin_date = State()
 
 # Вспомогательные функции для работы с БД
 async def get_user_companies(user_id: int):
@@ -189,6 +209,61 @@ async def get_property_sections_data(property_id: int):
         ''', property_id)
         return rows
 
+async def get_section_fields(property_id: int, section: str):
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch('''
+            SELECT field_key, field_name, text_content, file_id, file_type
+            FROM property_info
+            WHERE property_id = $1 AND section = $2
+            ORDER BY field_name
+        ''', property_id, section)
+        return rows
+
+async def create_booking(property_id: int, guest_name: str, checkin_date: str):
+    """Создание бронирования с уникальным кодом доступа"""
+    import secrets
+    access_code = secrets.token_urlsafe(32)
+    
+    async with db_pool.acquire() as conn:
+        booking_id = await conn.fetchval('''
+            INSERT INTO bookings (property_id, guest_name, checkin_date, access_code)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id
+        ''', property_id, guest_name, checkin_date, access_code)
+        return booking_id, access_code
+
+async def get_property_bookings(property_id: int):
+    """Получить активные бронирования объекта"""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch('''
+            SELECT id, guest_name, checkin_date, checkout_date, access_code, is_active
+            FROM bookings
+            WHERE property_id = $1 AND is_active = TRUE
+            ORDER BY checkin_date DESC
+        ''', property_id)
+        return rows
+
+async def get_booking_by_code(access_code: str):
+    """Получить бронирование по коду доступа"""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow('''
+            SELECT b.id, b.property_id, b.guest_name, b.checkin_date, b.is_active,
+                   p.name as property_name, p.address
+            FROM bookings b
+            JOIN properties p ON b.property_id = p.id
+            WHERE b.access_code = $1
+        ''', access_code)
+        return row
+
+async def complete_booking(booking_id: int):
+    """Завершить бронирование"""
+    async with db_pool.acquire() as conn:
+        await conn.execute('''
+            UPDATE bookings 
+            SET is_active = FALSE
+            WHERE id = $1
+        ''', booking_id)
+
 async def delete_property(property_id: int):
     async with db_pool.acquire() as conn:
         await conn.execute('DELETE FROM properties WHERE id = $1', property_id)
@@ -250,6 +325,30 @@ def get_property_menu_keyboard(property_id: int):
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="objects_menu")]
     ])
 
+def get_stores_subsection_keyboard(property_id: int):
+    """Клавиатура для подраздела Магазины, аптеки итд."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛒 Магазины", callback_data=f"field_shops_{property_id}")],
+        [InlineKeyboardButton(text="🚗 Аренда машин", callback_data=f"field_car_rental_{property_id}")],
+        [InlineKeyboardButton(text="🏃 Спорт", callback_data=f"field_sport_{property_id}")],
+        [InlineKeyboardButton(text="💊 Больницы", callback_data=f"field_hospitals_{property_id}")],
+        [InlineKeyboardButton(text="➕ Добавить кнопку", callback_data=f"add_custom_stores_{property_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"section_checkin_{property_id}")]
+    ])
+
+def get_rent_section_keyboard(property_id: int):
+    """Клавиатура для раздела Аренда"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📱 Телефоны УК", callback_data=f"field_uk_phones_{property_id}")],
+        [InlineKeyboardButton(text="👨‍💼 Телефон диспетчера", callback_data=f"field_dispatcher_{property_id}")],
+        [InlineKeyboardButton(text="🆘 Телефон аварийной службы", callback_data=f"field_emergency_{property_id}")],
+        [InlineKeyboardButton(text="💬 Домовые чаты", callback_data=f"field_chats_{property_id}")],
+        [InlineKeyboardButton(text="📝 Форма обратной связи", callback_data=f"field_feedback_form_{property_id}")],
+        [InlineKeyboardButton(text="🌐 Интернет", callback_data=f"field_internet_{property_id}")],
+        [InlineKeyboardButton(text="➕ Добавить кнопку", callback_data=f"add_custom_rent_{property_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"property_{property_id}")]
+    ])
+
 def get_checkin_section_keyboard(property_id: int):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🕐 Время заселения и выселения", callback_data=f"field_checkin_time_{property_id}")],
@@ -262,7 +361,7 @@ def get_checkin_section_keyboard(property_id: int):
         [InlineKeyboardButton(text="💰 Депозит", callback_data=f"field_deposit_{property_id}")],
         [InlineKeyboardButton(text="🔐 Дистанционное заселение", callback_data=f"field_remote_checkin_{property_id}")],
         [InlineKeyboardButton(text="🏠 Помощь с проживанием", callback_data=f"subsection_help_{property_id}")],
-        [InlineKeyboardButton(text="📍 Магазины, аптеки итд.", callback_data=f"field_stores_{property_id}")],
+        [InlineKeyboardButton(text="📍 Магазины, аптеки итд.", callback_data=f"subsection_stores_{property_id}")],
         [InlineKeyboardButton(text="📢 Правила проживания", callback_data=f"field_rules_{property_id}")],
         [InlineKeyboardButton(text="➕ Добавить кнопку", callback_data=f"add_custom_checkin_{property_id}")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"property_{property_id}")]
@@ -316,13 +415,22 @@ FIELD_NAMES = {
     'documents': 'Документы для заселения',
     'deposit': 'Депозит',
     'remote_checkin': 'Дистанционное заселение',
-    'stores': 'Магазины, аптеки итд.',
     'rules': 'Правила проживания',
     'breakfast': 'Завтрак',
     'linen': 'Поменять бельё',
     'manager_contact': 'Связь с менеджером',
     'tv_setup': 'Настройка ТВ',
     'ac': 'Кондиционер',
+    'shops': 'Магазины',
+    'car_rental': 'Аренда машин',
+    'sport': 'Спорт',
+    'hospitals': 'Больницы',
+    'uk_phones': 'Телефоны УК',
+    'dispatcher': 'Телефон диспетчера',
+    'emergency': 'Телефон аварийной службы',
+    'chats': 'Домовые чаты',
+    'feedback_form': 'Форма обратной связи',
+    'internet': 'Интернет',
     'excursions': 'Экскурсии',
     'museums': 'Музеи',
     'parks': 'Парки',
@@ -343,13 +451,25 @@ FIELD_DESCRIPTIONS = {
     'documents': 'Здесь вы можете прикрепить необходимые документы',
     'deposit': 'Здесь вы можете добавить информацию и залоге и правилах, при которых он будет возвращён',
     'remote_checkin': 'Расскажите, как проходит дистанционное заселение, где находится сейф и как получить пароль',
-    'stores': 'Информация о действия гостя в случае ЧП. Здесь вы можете оставить контактные данные или инструкции на такой случай',
     'rules': 'Здесь вы можете добавить информацию и залоге и правилах, при которых он будет возвращён',
     'breakfast': 'Расскажите, возможен ли заказ завтрака в апартаменты и укажите стоимость для этой услуги',
     'linen': 'Укажите, возможность замены белья в апартаментах и стоимость этой услуги',
     'manager_contact': 'Информация о действия гостя в случае ЧП. Здесь вы можете оставить контактные данные или инструкции на такой случай',
     'tv_setup': 'Здесь можно упомянуть возможности и особенности вашего телевизора',
     'ac': 'Например: где находится пульт, что делать если кондиционер не работает',
+    'shops': 'Расскажите, где поблизости можно взять в аренду автомобиль',
+    'car_rental': 'Расскажите, где поблизости можно взять в аренду автомобиль',
+    'sport': 'Расскажите, где поблизости можно заняться спортом. Например, в парке или в спортзале',
+    'hospitals': 'Расскажите, где поблизости находится больница или травмпункт',
+    'internet': 'В этом разделе, вы можете добавить информацию о интернет провайдере. Также не забудьте написать призыв отправлять фото с чеком об оплате интернета',
+    'excursions': 'Расскажите, какие в вашем городе или районе доступны экскурсии. Что интересного можно узнать о месте, где проживает гость.',
+    'museums': 'Расскажите, какие музеи есть рядом и какое у них направление.',
+    'parks': 'Расскажите, где можно погулять рядом с вашими апартаментами',
+    'entertainment': 'Расскажите, какие у вас есть кинотеатры и театры поблизости. Также можно явно упомянуть, ближайшие события',
+    'self_checkout': 'Расскажите, как можно выехать без участия менеджера. Какие шаги для этого необходимо выполнить?',
+    'deposit_return': 'Укажите инструкции как продлить проживание. Также можно явно упомянуть, что гость может связаться из этой категории с менеджером отправив сообщение',
+    'extend_stay': 'Укажите инструкции как продлить проживание. Также можно явно упомянуть, что гость может связаться из этой категории с менеджером отправив сообщение',
+    'discounts': 'Здесь можно добавить различные скидки и акции для постоянных клиентов'
 }
 
 # Обработчик команды /start
@@ -365,6 +485,33 @@ async def cmd_start(message: types.Message, state: FSMContext):
             ON CONFLICT (user_id) DO NOTHING
         ''', user_id, message.from_user.username, message.from_user.first_name)
     
+    # Проверяем, это гость или менеджер
+    start_param = message.text.split()[1] if len(message.text.split()) > 1 else None
+    
+    if start_param and start_param.startswith("guest_"):
+        # Режим гостя
+        access_code = start_param.replace("guest_", "")
+        booking = await get_booking_by_code(access_code)
+        
+        if booking and booking['is_active']:
+            property_id = booking['property_id']
+            property_name = booking['property_name']
+            address = booking['address']
+            
+            text = f"{property_name}\n\nАдрес апартаментов: {address}.\n\nВот информация, доступная для изучения:"
+            
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="➡️ Начать", callback_data=f"guest_start_{property_id}")],
+                [InlineKeyboardButton(text="🚕 Вызвать такси", url="https://taxi.yandex.ru")]
+            ])
+            
+            await message.answer(text, reply_markup=keyboard)
+            return
+        else:
+            await message.answer("Бронирование не найдено или неактивно. Обратитесь к менеджеру.")
+            return
+    
+    # Режим менеджера
     companies = await get_user_companies(user_id)
     
     if not companies:
@@ -389,6 +536,97 @@ async def cmd_start(message: types.Message, state: FSMContext):
             "по нескольким открытым базам данных, а также добавить свой отзыв."
         )
         await message.answer(text, reply_markup=get_main_menu_keyboard())
+
+# Команды бота
+@dp.message(Command("home"))
+async def cmd_home(message: types.Message):
+    """Главный экран"""
+    await cmd_start(message, None)
+
+@dp.message(Command("menu"))
+async def cmd_menu(message: types.Message, state: FSMContext):
+    """Главное меню"""
+    companies = await get_user_companies(message.from_user.id)
+    if companies:
+        await state.update_data(current_company_id=companies[0][0])
+    text = (
+        "Вы в главном меню бота 🏠\n\n"
+        "Если вы хотите добавить апартаменты и поделиться ссылкой с гостями, "
+        "переходите в раздел «Добавление и настройка объектов»"
+    )
+    await message.answer(text, reply_markup=get_main_menu_keyboard())
+
+@dp.message(Command("apartments"))
+async def cmd_apartments(message: types.Message, state: FSMContext):
+    """Добавление и настройка объектов"""
+    data = await state.get_data()
+    company_id = data.get('current_company_id')
+    
+    if not company_id:
+        companies = await get_user_companies(message.from_user.id)
+        if companies:
+            company_id = companies[0][0]
+            await state.update_data(current_company_id=company_id)
+    
+    if company_id:
+        properties = await get_company_properties(company_id)
+        await message.answer(
+            "Вот список ваших объектов. Здесь вы можете добавлять и редактировать их.",
+            reply_markup=get_objects_list_keyboard(properties)
+        )
+    else:
+        await message.answer("Сначала создайте компанию")
+
+@dp.message(Command("company"))
+async def cmd_company(message: types.Message, state: FSMContext):
+    """Личный кабинет компании"""
+    data = await state.get_data()
+    company_id = data.get('current_company_id')
+    
+    if not company_id:
+        companies = await get_user_companies(message.from_user.id)
+        if companies:
+            company_id = companies[0][0]
+            await state.update_data(current_company_id=company_id)
+    
+    if company_id:
+        async with db_pool.acquire() as conn:
+            result = await conn.fetchrow(
+                'SELECT name, city, welcome_message FROM companies WHERE id = $1',
+                company_id
+            )
+        
+        if result:
+            name, city, welcome_msg = result['name'], result['city'], result['welcome_message']
+            text = f"{name}\n{city}\n\nПриветствие гостя:\n{welcome_msg}\n\n* в данном разделе вы можете менять настройки вашей компании"
+            await message.answer(text)
+    else:
+        await message.answer("Компания не найдена")
+
+@dp.message(Command("podelu"))
+async def cmd_podelu(message: types.Message):
+    """Функции #чатаподелу"""
+    text = (
+        "Полезные разделы #чатаподелу. Для получения доступа к разделам обратитесь к "
+        "вашему персональному менеджеру: Анна @mir_any"
+    )
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏠 Найти новую квартиру", callback_data="podelu_find")],
+        [InlineKeyboardButton(text="💵 Задать вопрос бухгалтеру", callback_data="podelu_accountant")],
+        [InlineKeyboardButton(text="📦 Сделать общую закупку", callback_data="podelu_purchase")],
+        [InlineKeyboardButton(text="👥 Обменяться гостями", callback_data="podelu_exchange")],
+        [InlineKeyboardButton(text="⚖️ Задать вопрос юристу", callback_data="podelu_lawyer")],
+        [InlineKeyboardButton(text="📍 Найти выгодную локацию", callback_data="podelu_location")],
+        [InlineKeyboardButton(text="🪑 Обустроить квартиру", callback_data="podelu_furnish")],
+        [InlineKeyboardButton(text="📈 Инвестировать", callback_data="podelu_invest")],
+        [InlineKeyboardButton(text="📚 Полезные книги", callback_data="podelu_books")],
+        [InlineKeyboardButton(text="🧠 Психология", callback_data="podelu_psychology")],
+        [InlineKeyboardButton(text="🔥 Стать участником #чатаподелу", callback_data="podelu_join")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
+    ])
+    
+    await message.answer(text, reply_markup=keyboard)
 
 # Создание компании
 @dp.callback_query(F.data == "add_company")
@@ -540,12 +778,30 @@ async def section_checkin(callback: types.CallbackQuery):
     )
     await callback.answer()
 
+@dp.callback_query(F.data.startswith("section_rent_"))
+async def section_rent(callback: types.CallbackQuery):
+    property_id = int(callback.data.split("_")[2])
+    await callback.message.edit_text(
+        "Вы на странице категории 📹 Аренда",
+        reply_markup=get_rent_section_keyboard(property_id)
+    )
+    await callback.answer()
+
 @dp.callback_query(F.data.startswith("subsection_help_"))
 async def subsection_help(callback: types.CallbackQuery):
     property_id = int(callback.data.split("_")[2])
     await callback.message.edit_text(
         "Вы на странице категории 🏠 Помощь с проживанием",
         reply_markup=get_help_subsection_keyboard(property_id)
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("subsection_stores_"))
+async def subsection_stores(callback: types.CallbackQuery):
+    property_id = int(callback.data.split("_")[2])
+    await callback.message.edit_text(
+        "Вы на странице категории 📍 Магазины, аптеки итд.",
+        reply_markup=get_stores_subsection_keyboard(property_id)
     )
     await callback.answer()
 
@@ -581,6 +837,10 @@ async def edit_field(callback: types.CallbackQuery, state: FSMContext):
     section = "checkin"
     if field_key in ['breakfast', 'linen', 'manager_contact', 'tv_setup', 'ac']:
         section = "help"
+    elif field_key in ['shops', 'car_rental', 'sport', 'hospitals']:
+        section = "stores"
+    elif field_key in ['uk_phones', 'dispatcher', 'emergency', 'chats', 'feedback_form', 'internet']:
+        section = "rent"
     elif field_key in ['excursions', 'museums', 'parks', 'entertainment']:
         section = "experiences"
     elif field_key in ['self_checkout', 'deposit_return', 'extend_stay', 'discounts']:
@@ -598,6 +858,105 @@ async def edit_field(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.edit_text(text, reply_markup=get_field_edit_keyboard(property_id, section))
     await state.set_state(PropertyStates.editing_field)
     await callback.answer()
+
+# Добавление кастомных кнопок
+@dp.callback_query(F.data.startswith("add_custom_"))
+async def add_custom_button_start(callback: types.CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    section = parts[2]
+    property_id = int(parts[3])
+    
+    await state.update_data(
+        custom_section=section,
+        custom_property_id=property_id
+    )
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"section_{section}_{property_id}")],
+        [InlineKeyboardButton(text="⏭ Пропустить", callback_data=f"section_{section}_{property_id}")]
+    ])
+    
+    await callback.message.edit_text(
+        "Вы редактируете кнопку\n\nВведите название кнопки:",
+        reply_markup=keyboard
+    )
+    await state.set_state(PropertyStates.adding_custom_button_name)
+    await callback.answer()
+
+@dp.message(PropertyStates.adding_custom_button_name)
+async def process_custom_button_name(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    custom_name = message.text
+    section = data['custom_section']
+    property_id = data['custom_property_id']
+    
+    await state.update_data(custom_button_name=custom_name)
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"section_{section}_{property_id}")],
+        [InlineKeyboardButton(text="⏭ Пропустить", callback_data=f"section_{section}_{property_id}")]
+    ])
+    
+    await message.answer(
+        f"Вы редактируете кнопку\n\nВведите содержимое кнопки:",
+        reply_markup=keyboard
+    )
+    await state.set_state(PropertyStates.adding_custom_button_content)
+
+@dp.message(PropertyStates.adding_custom_button_content)
+async def process_custom_button_content(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    property_id = data['custom_property_id']
+    section = data['custom_section']
+    field_name = data['custom_button_name']
+    field_key = f"custom_{field_name.lower().replace(' ', '_')}"
+    
+    text_content = None
+    file_id = None
+    file_type = None
+    
+    if message.text:
+        text_content = message.text
+    elif message.photo:
+        file_id = message.photo[-1].file_id
+        file_type = "photo"
+        text_content = message.caption
+    elif message.video:
+        file_id = message.video.file_id
+        file_type = "video"
+        text_content = message.caption
+    elif message.document:
+        file_id = message.document.file_id
+        file_type = "document"
+        text_content = message.caption
+    
+    await save_property_field(property_id, section, field_key, field_name, text_content, file_id, file_type)
+    
+    # Возвращаемся в раздел
+    keyboard = None
+    text = ""
+    
+    if section == "help":
+        keyboard = get_help_subsection_keyboard(property_id)
+        text = "Вы на странице категории 🏠 Помощь с проживанием"
+    elif section == "stores":
+        keyboard = get_stores_subsection_keyboard(property_id)
+        text = "Вы на странице категории 📍 Магазины, аптеки итд."
+    elif section == "rent":
+        keyboard = get_rent_section_keyboard(property_id)
+        text = "Вы на странице категории 📹 Аренда"
+    elif section == "experiences":
+        keyboard = get_experiences_section_keyboard(property_id)
+        text = "Раздел: Впечатления"
+    elif section == "checkout":
+        keyboard = get_checkout_section_keyboard(property_id)
+        text = "Раздел: Выселение"
+    else:
+        keyboard = get_checkin_section_keyboard(property_id)
+        text = "Вы на странице категории 🧳 Заселение"
+    
+    await message.answer(text, reply_markup=keyboard)
+    await state.clear()
 
 @dp.message(PropertyStates.editing_field)
 async def process_field_content(message: types.Message, state: FSMContext):
@@ -632,6 +991,12 @@ async def process_field_content(message: types.Message, state: FSMContext):
     if section == "help":
         keyboard = get_help_subsection_keyboard(property_id)
         text = "Вы на странице категории 🏠 Помощь с проживанием"
+    elif section == "stores":
+        keyboard = get_stores_subsection_keyboard(property_id)
+        text = "Вы на странице категории 📍 Магазины, аптеки итд."
+    elif section == "rent":
+        keyboard = get_rent_section_keyboard(property_id)
+        text = "Вы на странице категории 📹 Аренда"
     elif section == "experiences":
         keyboard = get_experiences_section_keyboard(property_id)
         text = "Раздел: Впечатления"
@@ -654,6 +1019,12 @@ async def skip_field(callback: types.CallbackQuery, state: FSMContext):
     if section == "help":
         keyboard = get_help_subsection_keyboard(property_id)
         text = "Вы на странице категории 🏠 Помощь с проживанием"
+    elif section == "stores":
+        keyboard = get_stores_subsection_keyboard(property_id)
+        text = "Вы на странице категории 📍 Магазины, аптеки итд."
+    elif section == "rent":
+        keyboard = get_rent_section_keyboard(property_id)
+        text = "Вы на странице категории 📹 Аренда"
     elif section == "experiences":
         keyboard = get_experiences_section_keyboard(property_id)
         text = "Раздел: Впечатления"
@@ -667,6 +1038,149 @@ async def skip_field(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.edit_text(text, reply_markup=keyboard)
     await state.clear()
     await callback.answer()
+
+# Бронирования
+@dp.callback_query(F.data.startswith("bookings_"))
+async def bookings_menu(callback: types.CallbackQuery):
+    property_id = int(callback.data.split("_")[1])
+    
+    # Получаем активные бронирования
+    bookings = await get_property_bookings(property_id)
+    
+    text = (
+        "Ниже перечислены ваши бронирования. Бронь необходимо выдавать гостю, чтобы он мог получить доступ к закрытой "
+        "информации для вашего объекта. Например, информацию о коде для сейфа.\n\n"
+        "После проживания бронирование нужно завершить."
+    )
+    
+    buttons = []
+    
+    for booking in bookings:
+        guest_name = booking['guest_name']
+        checkin = booking['checkin_date'].strftime('%d.%m.%y')
+        icon = "🔴" if booking['is_active'] else "⚪"
+        buttons.append([InlineKeyboardButton(
+            text=f"{guest_name} — {checkin} {icon}",
+            callback_data=f"view_booking_{booking['id']}"
+        )])
+    
+    buttons.append([InlineKeyboardButton(text="➕ Добавить бронирование", callback_data=f"add_booking_{property_id}")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"property_{property_id}")])
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("add_booking_"))
+async def add_booking(callback: types.CallbackQuery, state: FSMContext):
+    property_id = int(callback.data.split("_")[2])
+    
+    await state.update_data(booking_property_id=property_id)
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"bookings_{property_id}")],
+        [InlineKeyboardButton(text="⏭ Пропустить", callback_data=f"bookings_{property_id}")]
+    ])
+    
+    await callback.message.edit_text(
+        "Вы редактируете кнопку\n\nВведите ФИО гостя:",
+        reply_markup=keyboard
+    )
+    await state.set_state(BookingStates.waiting_guest_name)
+    await callback.answer()
+
+@dp.message(BookingStates.waiting_guest_name)
+async def process_guest_name(message: types.Message, state: FSMContext):
+    await state.update_data(guest_name=message.text)
+    
+    data = await state.get_data()
+    property_id = data['booking_property_id']
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"bookings_{property_id}")],
+        [InlineKeyboardButton(text="⏭ Пропустить", callback_data=f"bookings_{property_id}")]
+    ])
+    
+    await message.answer(
+        "Введите дату заезда в формате 20.06.2025",
+        reply_markup=keyboard
+    )
+    await state.set_state(BookingStates.waiting_checkin_date)
+
+@dp.message(BookingStates.waiting_checkin_date)
+async def process_checkin_date(message: types.Message, state: FSMContext):
+    from datetime import datetime
+    
+    data = await state.get_data()
+    property_id = data['booking_property_id']
+    guest_name = data['guest_name']
+    
+    try:
+        # Парсим дату
+        checkin_date = datetime.strptime(message.text, '%d.%m.%Y').date()
+        
+        # Создаем бронирование
+        booking_id, access_code = await create_booking(property_id, guest_name, str(checkin_date))
+        
+        # Генерируем ссылку для гостя
+        bot_username = (await bot.get_me()).username
+        guest_link = f"https://t.me/{bot_username}?start=guest_{access_code}"
+        
+        text = (
+            f"Ниже перечислены ваши бронирования. Бронь необходимо выдавать гостю, чтобы он мог получить доступ к закрытой "
+            f"информации для вашего объекта. Например, информацию о коде для сейфа.\n\n"
+            f"После проживания бронирование нужно завершить."
+        )
+        
+        # Получаем обновленный список бронирований
+        bookings = await get_property_bookings(property_id)
+        
+        buttons = []
+        for booking in bookings:
+            b_guest_name = booking['guest_name']
+            b_checkin = booking['checkin_date'].strftime('%d.%m.%y')
+            icon = "🔴" if booking['is_active'] else "⚪"
+            buttons.append([InlineKeyboardButton(
+                text=f"{b_guest_name} — {b_checkin} {icon}",
+                callback_data=f"view_booking_{booking['id']}"
+            )])
+        
+        buttons.append([InlineKeyboardButton(text="➕ Добавить бронирование", callback_data=f"add_booking_{property_id}")])
+        buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"property_{property_id}")])
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+        
+        await message.answer(text, reply_markup=keyboard)
+        await message.answer(f"🔗 Ссылка для гостя:\n{guest_link}")
+        await state.clear()
+        
+    except ValueError:
+        await message.answer("Неверный формат даты. Используйте формат: 20.06.2025")
+
+@dp.callback_query(F.data.startswith("view_booking_"))
+async def view_booking(callback: types.CallbackQuery):
+    booking_id = int(callback.data.split("_")[2])
+    
+    # Здесь можно показать детали бронирования и кнопку завершения
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Завершить бронирование", callback_data=f"complete_booking_{booking_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="bookings_1")]
+    ])
+    
+    await callback.message.edit_text(
+        "Детали бронирования",
+        reply_markup=keyboard
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("complete_booking_"))
+async def complete_booking_handler(callback: types.CallbackQuery):
+    booking_id = int(callback.data.split("_")[2])
+    await complete_booking(booking_id)
+    await callback.answer("Бронирование завершено")
+    # Возвращаемся к списку бронирований
+    await callback.message.edit_text("Бронирование завершено")
 
 # Предпросмотр объекта
 @dp.callback_query(F.data.startswith("preview_"))
@@ -750,10 +1264,141 @@ async def toggle_shortterm(callback: types.CallbackQuery):
     await callback.answer("Режим переключен")
     await view_property(callback)
 
+# Ссылка для владельца объекта
+@dp.callback_query(F.data.startswith("owner_link_"))
+async def generate_owner_link(callback: types.CallbackQuery):
+    property_id = int(callback.data.split("_")[2])
+    property_name = await get_property_name(property_id)
+    
+    # Генерируем уникальную ссылку для владельца
+    bot_username = (await bot.get_me()).username
+    owner_link = f"https://t.me/{bot_username}?start=owner_{property_id}"
+    
+    text = f"Ссылка для приглашения менеджера в компанию, по-умолчанию менеджер не может удалять объекты:\n{owner_link}"
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"property_{property_id}")]
+    ])
+    
+    await callback.message.answer(text, reply_markup=keyboard)
+    await callback.answer()
+
 # Заглушки
 @dp.callback_query(F.data.in_(["connect_calendar", "guest_check", "feedback", "company_cabinet"]))
 async def placeholder(callback: types.CallbackQuery):
     await callback.answer("Функция в разработке", show_alert=True)
+
+# Режим гостя
+@dp.callback_query(F.data.startswith("guest_start_"))
+async def guest_start(callback: types.CallbackQuery, state: FSMContext):
+    property_id = int(callback.data.split("_")[2])
+    
+    # Сохраняем, что пользователь в режиме гостя
+    await state.update_data(guest_mode=True, guest_property_id=property_id)
+    
+    property_name = await get_property_name(property_id)
+    
+    text = f"{property_name}\n\nВот информация, доступная для изучения:"
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🧳 Заселение", callback_data=f"guest_section_checkin_{property_id}")],
+        [InlineKeyboardButton(text="Переключится в режим владельца бота", callback_data="switch_to_owner")]
+    ])
+    
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("guest_section_"))
+async def guest_view_section(callback: types.CallbackQuery):
+    """Показать раздел для гостя"""
+    parts = callback.data.split("_")
+    section = parts[2]
+    property_id = int(parts[3])
+    
+    # Получаем все поля раздела
+    fields = await get_section_fields(property_id, section)
+    
+    if not fields:
+        await callback.answer("В этом разделе пока нет информации", show_alert=True)
+        return
+    
+    # Формируем сообщение с информацией
+    property_name = await get_property_name(property_id)
+    text = f"{property_name}\n\n"
+    
+    for field in fields:
+        field_name = field['field_name']
+        text_content = field['text_content']
+        file_id = field['file_id']
+        file_type = field['file_type']
+        
+        text += f"\n📌 {field_name}\n"
+        if text_content:
+            text += f"{text_content}\n"
+        
+        # Отправляем медиа файлы отдельно
+        if file_id:
+            try:
+                if file_type == "photo":
+                    await callback.message.answer_photo(file_id, caption=field_name)
+                elif file_type == "video":
+                    await callback.message.answer_video(file_id, caption=field_name)
+                elif file_type == "document":
+                    await callback.message.answer_document(file_id, caption=field_name)
+            except Exception as e:
+                logger.error(f"Error sending media: {e}")
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"guest_start_{property_id}")]
+    ])
+    
+    await callback.message.answer(text, reply_markup=keyboard)
+    await callback.answer()
+
+@dp.callback_query(F.data == "switch_to_owner")
+async def switch_to_owner_mode(callback: types.CallbackQuery, state: FSMContext):
+    """Переключение из режима гостя в режим владельца"""
+    await state.clear()
+    
+    companies = await get_user_companies(callback.from_user.id)
+    
+    if companies:
+        await state.update_data(current_company_id=companies[0][0])
+        text = (
+            "Вы в главном меню бота 🏠\n\n"
+            "Если вы хотите добавить апартаменты и поделиться ссылкой с гостями, "
+            "переходите в раздел «Добавление и настройка объектов»"
+        )
+        await callback.message.edit_text(text, reply_markup=get_main_menu_keyboard())
+    else:
+        await callback.message.edit_text(
+            "Для работы в режиме владельца создайте компанию",
+            reply_markup=get_add_company_keyboard()
+        )
+    
+    await callback.answer("Переключено в режим владельца")
+
+# Обработчики для /podelu
+@dp.callback_query(F.data.startswith("podelu_"))
+async def podelu_handlers(callback: types.CallbackQuery):
+    """Заглушки для функций раздела /podelu"""
+    action = callback.data.replace("podelu_", "")
+    
+    messages = {
+        "find": "Функция поиска новой квартиры в разработке",
+        "accountant": "Свяжитесь с бухгалтером через @mir_any",
+        "purchase": "Функция общих закупок в разработке",
+        "exchange": "Функция обмена гостями в разработке",
+        "lawyer": "Свяжитесь с юристом через @mir_any",
+        "location": "Функция поиска локаций в разработке",
+        "furnish": "Функция обустройства квартир в разработке",
+        "invest": "Функция инвестирования в разработке",
+        "books": "Функция полезных книг в разработке",
+        "psychology": "Функция психологии в разработке",
+        "join": "Для вступления в #чатаподелу обратитесь к @mir_any"
+    }
+    
+    await callback.answer(messages.get(action, "В разработке"), show_alert=True)
 
 # Запуск бота
 async def main():
