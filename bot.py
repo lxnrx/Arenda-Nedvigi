@@ -25,19 +25,21 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:PECPoXHNBUxpIFYo
 
 # Инициализация бота
 bot = Bot(token=BOT_TOKEN)
-storage = MemoryStorage()
+storage = MemoryStorage()  # TODO: use RedisStorage in production for persistence
 dp = Dispatcher(storage=storage)
 
 # Глобальный пул соединений
 db_pool: Optional[asyncpg.Pool] = None
 
 # Флаг для graceful shutdown
-shutdown_flag = False
+stop_event = asyncio.Event()
 
 # Инициализация базы данных
 async def init_db():
     global db_pool
     db_pool = await asyncpg.create_pool(DATABASE_URL)
+# NOTE: Configure min_size/max_size and consider connection error handling/timeouts.
+
     
     async with db_pool.acquire() as conn:
         # Таблица пользователей
@@ -182,6 +184,10 @@ async def get_company_info(company_id: int):
         ''', company_id)
 
 async def update_company_field(company_id: int, field: str, value):
+
+    # allowlist check for field name to prevent SQL injection via column name
+    if field not in ALLOWED_COMPANY_FIELDS:
+        raise ValueError("Invalid company field")
     """Обновить поле компании"""
     async with db_pool.acquire() as conn:
         await conn.execute(f'''
@@ -251,6 +257,37 @@ async def get_section_fields(property_id: int, section: str):
 async def create_booking(property_id: int, guest_name: str, checkin_date):
     """Создание бронирования с уникальным кодом доступа"""
     import secrets
+
+# === Security & utility helpers (inserted) ===
+ALLOWED_COMPANY_FIELDS = {
+    "name", "city", "welcome_message", "timezone_offset", "checkin_time", "checkout_time", "long_term_only"
+}
+
+def parse_callback_parts(data: str, min_len: int = 2):
+    if not isinstance(data, str):
+        raise ValueError("callback data is not a string")
+    parts = data.split("_")
+    if len(parts) < min_len:
+        raise ValueError("Malformed callback data")
+    return parts
+
+async def user_has_access_to_property(db_pool, user_id: int, property_id: int) -> bool:
+    try:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow('''
+                SELECT uc.is_admin
+                FROM properties p
+                JOIN companies c ON p.company_id = c.id
+                JOIN user_companies uc ON uc.company_id = c.id
+                WHERE p.id = $1 AND uc.user_id = $2
+            ''', property_id, user_id)
+            return bool(row)
+    except Exception:
+        # on DB failure be conservative and deny access
+        return False
+
+# ============================================
+
     access_code = secrets.token_urlsafe(32)
     
     # Если checkin_date это строка, конвертируем в date объект
@@ -1876,7 +1913,7 @@ async def main():
     
     def signal_handler():
         logger.info("Received shutdown signal")
-        shutdown_flag = True
+        stop_event.set()
     
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, signal_handler)
