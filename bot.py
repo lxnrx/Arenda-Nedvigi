@@ -248,10 +248,15 @@ async def get_section_fields(property_id: int, section: str):
         ''', property_id, section)
         return rows
 
-async def create_booking(property_id: int, guest_name: str, checkin_date: str):
+async def create_booking(property_id: int, guest_name: str, checkin_date):
     """Создание бронирования с уникальным кодом доступа"""
     import secrets
     access_code = secrets.token_urlsafe(32)
+    
+    # Если checkin_date это строка, конвертируем в date объект
+    if isinstance(checkin_date, str):
+        from datetime import datetime
+        checkin_date = datetime.strptime(checkin_date, '%Y-%m-%d').date()
     
     async with db_pool.acquire() as conn:
         booking_id = await conn.fetchval('''
@@ -1082,6 +1087,12 @@ async def view_property(callback: types.CallbackQuery):
     
     await callback.answer()
 
+# Редактирование объекта (название и адрес)
+@dp.callback_query(F.data.startswith("edit_property_"))
+async def edit_property_info(callback: types.CallbackQuery):
+    """Заглушка для редактирования основной информации об объекте"""
+    await callback.answer("Функция редактирования основной информации в разработке. Используйте разделы ниже для редактирования содержимого.", show_alert=True)
+
 # Разделы объекта
 @dp.callback_query(F.data.startswith("section_checkin_"))
 async def section_checkin(callback: types.CallbackQuery):
@@ -1434,8 +1445,8 @@ async def process_checkin_date(message: types.Message, state: FSMContext):
         # Парсим дату
         checkin_date = datetime.strptime(message.text, '%d.%m.%Y').date()
         
-        # Создаем бронирование
-        booking_id, access_code = await create_booking(property_id, guest_name, str(checkin_date))
+        # Создаем бронирование - передаем объект date напрямую
+        booking_id, access_code = await create_booking(property_id, guest_name, checkin_date)
         
         # Генерируем ссылку для гостя
         bot_username = (await bot.get_me()).username
@@ -1476,10 +1487,16 @@ async def process_checkin_date(message: types.Message, state: FSMContext):
 async def view_booking(callback: types.CallbackQuery):
     booking_id = int(callback.data.split("_")[2])
     
-    # Здесь можно показать детали бронирования и кнопку завершения
+    # Получаем property_id для правильной навигации
+    async with db_pool.acquire() as conn:
+        property_id = await conn.fetchval(
+            'SELECT property_id FROM bookings WHERE id = $1',
+            booking_id
+        )
+    
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Завершить бронирование", callback_data=f"complete_booking_{booking_id}")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="bookings_1")]
+        [InlineKeyboardButton(text="✅ Завершить бронирование", callback_data=f"complete_booking_{booking_id}_{property_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"bookings_{property_id}")]
     ])
     
     await callback.message.edit_text(
@@ -1490,11 +1507,42 @@ async def view_booking(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("complete_booking_"))
 async def complete_booking_handler(callback: types.CallbackQuery):
-    booking_id = int(callback.data.split("_")[2])
+    parts = callback.data.split("_")
+    booking_id = int(parts[2])
+    property_id = int(parts[3]) if len(parts) > 3 else None
+    
     await complete_booking(booking_id)
+    
+    # Если property_id известен, возвращаемся к списку бронирований
+    if property_id:
+        bookings = await get_property_bookings(property_id)
+        
+        text = (
+            "Бронирование завершено.\n\n"
+            "Ниже перечислены ваши бронирования. Бронь необходимо выдавать гостю, чтобы он мог получить доступ к закрытой "
+            "информации для вашего объекта. Например, информацию о коде для сейфа.\n\n"
+            "После проживания бронирование нужно завершить."
+        )
+        
+        buttons = []
+        for booking in bookings:
+            guest_name = booking['guest_name']
+            checkin = booking['checkin_date'].strftime('%d.%m.%y')
+            icon = "🔴" if booking['is_active'] else "⚪"
+            buttons.append([InlineKeyboardButton(
+                text=f"{guest_name} — {checkin} {icon}",
+                callback_data=f"view_booking_{booking['id']}"
+            )])
+        
+        buttons.append([InlineKeyboardButton(text="➕ Добавить бронирование", callback_data=f"add_booking_{property_id}")])
+        buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"property_{property_id}")])
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+        await callback.message.edit_text(text, reply_markup=keyboard)
+    else:
+        await callback.message.edit_text("Бронирование завершено")
+    
     await callback.answer("Бронирование завершено")
-    # Возвращаемся к списку бронирований
-    await callback.message.edit_text("Бронирование завершено")
 
 # Предпросмотр объекта
 @dp.callback_query(F.data.startswith("preview_"))
@@ -1652,8 +1700,10 @@ async def toggle_shortterm_handler(callback: types.CallbackQuery):
     property_id = int(callback.data.split("_")[2])
     await toggle_short_term(property_id)
     
+    property_name = await get_property_name(property_id)
+    text = f"Вы на странице объекта {property_name}.\n\nТут вы можете отредактировать информацию о объекте, которая будет доступна гостям."
+    await callback.message.edit_text(text, reply_markup=get_property_menu_keyboard(property_id))
     await callback.answer("Режим переключен")
-    await view_property(callback)
 
 # Ссылка для владельца объекта
 @dp.callback_query(F.data.startswith("owner_link_"))
