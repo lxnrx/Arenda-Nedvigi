@@ -128,6 +128,9 @@ class CompanyStates(StatesGroup):
     waiting_timezone = State()
     waiting_checkin_time = State()
     waiting_checkout_time = State()
+    editing_company_name = State()
+    editing_company_city = State()
+    editing_company_welcome = State()
 
 class PropertyStates(StatesGroup):
     waiting_property_name = State()
@@ -167,6 +170,25 @@ async def create_company(name: str, city: str, user_id: int):
         ''', user_id, company_id)
         
         return company_id
+
+async def get_company_info(company_id: int):
+    """Получить полную информацию о компании"""
+    async with db_pool.acquire() as conn:
+        return await conn.fetchrow('''
+            SELECT id, name, city, welcome_message, timezone_offset, 
+                   checkin_time, checkout_time, long_term_only
+            FROM companies 
+            WHERE id = $1
+        ''', company_id)
+
+async def update_company_field(company_id: int, field: str, value):
+    """Обновить поле компании"""
+    async with db_pool.acquire() as conn:
+        await conn.execute(f'''
+            UPDATE companies 
+            SET {field} = $1
+            WHERE id = $2
+        ''', value, company_id)
 
 async def get_company_properties(company_id: int):
     async with db_pool.acquire() as conn:
@@ -291,10 +313,7 @@ async def get_property_name(property_id: int):
 def get_main_menu_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🏠 Добавление и настройка объектов", callback_data="objects_menu")],
-        [InlineKeyboardButton(text="🏢 Личный кабинет компании", callback_data="company_cabinet")],
-        [InlineKeyboardButton(text="🔌 Подключить шахматку", callback_data="connect_calendar")],
-        [InlineKeyboardButton(text="📱 Проверка гостя", callback_data="guest_check")],
-        [InlineKeyboardButton(text="💡 Что улучшить в боте?", callback_data="feedback")]
+        [InlineKeyboardButton(text="🏢 Личный кабинет компании", callback_data="company_cabinet")]
     ])
 
 def get_add_company_keyboard():
@@ -305,6 +324,23 @@ def get_add_company_keyboard():
 def get_back_keyboard(callback="back"):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ Назад", callback_data=callback)]
+    ])
+
+def get_company_cabinet_keyboard(company_info):
+    """Клавиатура личного кабинета компании"""
+    long_term_text = "Да" if company_info['long_term_only'] else "Нет"
+    
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Изменить название", callback_data="edit_company_name")],
+        [InlineKeyboardButton(text="Изменить город", callback_data="edit_company_city")],
+        [InlineKeyboardButton(text="Изменить приветствие", callback_data="edit_company_welcome")],
+        [InlineKeyboardButton(text="Изменить часовой пояс А мин.", callback_data="edit_company_timezone")],
+        [InlineKeyboardButton(text=f"Время заезда {company_info['checkin_time']}", callback_data="edit_checkin_time")],
+        [InlineKeyboardButton(text=f"Только долгосрок: {long_term_text}", callback_data="toggle_long_term")],
+        [InlineKeyboardButton(text=f"Время выезда {company_info['checkout_time']}", callback_data="edit_checkout_time")],
+        [InlineKeyboardButton(text="Пригласить менеджера", callback_data="invite_manager")],
+        [InlineKeyboardButton(text="Менеджеры", callback_data="managers_list")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
     ])
 
 def get_objects_list_keyboard(properties):
@@ -479,6 +515,20 @@ FIELD_DESCRIPTIONS = {
     'discounts': 'Здесь можно добавить различные скидки и акции для постоянных клиентов'
 }
 
+SECTION_ICONS = {
+    'checkin': '🧳',
+    'rent': '📹',
+    'experiences': '🍿',
+    'checkout': '📦'
+}
+
+SECTION_NAMES = {
+    'checkin': 'Заселение',
+    'rent': 'Аренда',
+    'experiences': 'Впечатления',
+    'checkout': 'Выселение'
+}
+
 # Обработчик команды /start
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
@@ -538,17 +588,37 @@ async def cmd_start(message: types.Message, state: FSMContext):
             "Если вы хотите добавить апартаменты и поделиться ссылкой с гостями, "
             "переходите в раздел «Добавление и настройка объектов»\n\n"
             "Если вы хотите изменить общие настройки компании или её название и город, "
-            "переходите в раздел «Личный кабинет компании»\n\n"
-            "В разделе «Проверка гостя», вы получаете доступ к возможности проверить гостя "
-            "по нескольким открытым базам данных, а также добавить свой отзыв."
+            "переходите в раздел «Личный кабинет компании»"
         )
         await message.answer(text, reply_markup=get_main_menu_keyboard())
 
 # Команды бота
 @dp.message(Command("home"))
-async def cmd_home(message: types.Message):
+async def cmd_home(message: types.Message, state: FSMContext):
     """Главный экран"""
-    await cmd_start(message, None)
+    user_id = message.from_user.id
+    companies = await get_user_companies(user_id)
+    
+    if not companies:
+        text = (
+            "Добро пожаловать в #ботподелу.\n\n"
+            "Для того, чтобы пользоваться ботом, вам необходимо выбрать компанию. "
+            "Если ваши коллеги уже создали компанию, необходимо, чтобы они поделились с вами пригласительной ссылкой.\n\n"
+            "Если вы хотите создать свою компанию, нажмите на кнопку «Добавить компанию».\n\n"
+            "К этому сообщению мы прикрепили подробную инструкцию как пользоваться ботом. "
+            "Вы сможете вернуться к ней позже, если потребуется."
+        )
+        await message.answer(text, reply_markup=get_add_company_keyboard())
+    else:
+        await state.update_data(current_company_id=companies[0][0])
+        text = (
+            "Вы в главном меню бота 🏠\n\n"
+            "Если вы хотите добавить апартаменты и поделиться ссылкой с гостями, "
+            "переходите в раздел «Добавление и настройка объектов»\n\n"
+            "Если вы хотите изменить общие настройки компании или её название и город, "
+            "переходите в раздел «Личный кабинет компании»"
+        )
+        await message.answer(text, reply_markup=get_main_menu_keyboard())
 
 @dp.message(Command("menu"))
 async def cmd_menu(message: types.Message, state: FSMContext):
@@ -597,43 +667,20 @@ async def cmd_company(message: types.Message, state: FSMContext):
             await state.update_data(current_company_id=company_id)
     
     if company_id:
-        async with db_pool.acquire() as conn:
-            result = await conn.fetchrow(
-                'SELECT name, city, welcome_message FROM companies WHERE id = $1',
-                company_id
-            )
+        company_info = await get_company_info(company_id)
         
-        if result:
-            name, city, welcome_msg = result['name'], result['city'], result['welcome_message']
-            text = f"{name}\n{city}\n\nПриветствие гостя:\n{welcome_msg}\n\n* в данном разделе вы можете менять настройки вашей компании"
-            await message.answer(text)
+        if company_info:
+            long_term_text = "Да" if company_info['long_term_only'] else "Нет"
+            text = (
+                f"{company_info['name']}\n"
+                f"{company_info['city']}\n\n"
+                f"Приветствие гостя:\n"
+                f"{company_info['welcome_message']}\n\n"
+                f"* в данном разделе вы можете менять настройки вашей компании"
+            )
+            await message.answer(text, reply_markup=get_company_cabinet_keyboard(company_info))
     else:
         await message.answer("Компания не найдена")
-
-@dp.message(Command("podelu"))
-async def cmd_podelu(message: types.Message):
-    """Функции #чатаподелу"""
-    text = (
-        "Полезные разделы #чатаподелу. Для получения доступа к разделам обратитесь к "
-        "вашему персональному менеджеру: Анна @mir_any"
-    )
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏠 Найти новую квартиру", callback_data="podelu_find")],
-        [InlineKeyboardButton(text="💵 Задать вопрос бухгалтеру", callback_data="podelu_accountant")],
-        [InlineKeyboardButton(text="📦 Сделать общую закупку", callback_data="podelu_purchase")],
-        [InlineKeyboardButton(text="👥 Обменяться гостями", callback_data="podelu_exchange")],
-        [InlineKeyboardButton(text="⚖️ Задать вопрос юристу", callback_data="podelu_lawyer")],
-        [InlineKeyboardButton(text="📍 Найти выгодную локацию", callback_data="podelu_location")],
-        [InlineKeyboardButton(text="🪑 Обустроить квартиру", callback_data="podelu_furnish")],
-        [InlineKeyboardButton(text="📈 Инвестировать", callback_data="podelu_invest")],
-        [InlineKeyboardButton(text="📚 Полезные книги", callback_data="podelu_books")],
-        [InlineKeyboardButton(text="🧠 Психология", callback_data="podelu_psychology")],
-        [InlineKeyboardButton(text="🔥 Стать участником #чатаподелу", callback_data="podelu_join")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
-    ])
-    
-    await message.answer(text, reply_markup=keyboard)
 
 # Создание компании
 @dp.callback_query(F.data == "add_company")
@@ -678,6 +725,266 @@ async def main_menu(callback: types.CallbackQuery):
         "переходите в раздел «Добавление и настройка объектов»"
     )
     await callback.message.edit_text(text, reply_markup=get_main_menu_keyboard())
+    await callback.answer()
+
+# Личный кабинет компании
+@dp.callback_query(F.data == "company_cabinet")
+async def company_cabinet(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    company_id = data.get('current_company_id')
+    
+    if not company_id:
+        companies = await get_user_companies(callback.from_user.id)
+        if companies:
+            company_id = companies[0][0]
+            await state.update_data(current_company_id=company_id)
+        else:
+            await callback.message.edit_text(
+                "Сначала создайте компанию",
+                reply_markup=get_add_company_keyboard()
+            )
+            await callback.answer()
+            return
+    
+    company_info = await get_company_info(company_id)
+    
+    if company_info:
+        long_term_text = "Да" if company_info['long_term_only'] else "Нет"
+        text = (
+            f"{company_info['name']}\n"
+            f"{company_info['city']}\n\n"
+            f"Приветствие гостя:\n"
+            f"{company_info['welcome_message']}\n\n"
+            f"* в данном разделе вы можете менять настройки вашей компании"
+        )
+        await callback.message.edit_text(text, reply_markup=get_company_cabinet_keyboard(company_info))
+    
+    await callback.answer()
+
+# Редактирование компании
+@dp.callback_query(F.data == "edit_company_name")
+async def edit_company_name(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "Напишите название компании и нажмите ввод 👇",
+        reply_markup=get_back_keyboard("company_cabinet")
+    )
+    await state.set_state(CompanyStates.editing_company_name)
+    await callback.answer()
+
+@dp.message(CompanyStates.editing_company_name)
+async def process_edit_company_name(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    company_id = data.get('current_company_id')
+    
+    await update_company_field(company_id, 'name', message.text)
+    
+    company_info = await get_company_info(company_id)
+    text = (
+        f"{company_info['name']}\n"
+        f"{company_info['city']}\n\n"
+        f"Приветствие гостя:\n"
+        f"{company_info['welcome_message']}\n\n"
+        f"* в данном разделе вы можете менять настройки вашей компании"
+    )
+    await message.answer(text, reply_markup=get_company_cabinet_keyboard(company_info))
+    await state.clear()
+
+@dp.callback_query(F.data == "edit_company_city")
+async def edit_company_city(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "Напишите город компании и нажмите ввод 👇",
+        reply_markup=get_back_keyboard("company_cabinet")
+    )
+    await state.set_state(CompanyStates.editing_company_city)
+    await callback.answer()
+
+@dp.message(CompanyStates.editing_company_city)
+async def process_edit_company_city(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    company_id = data.get('current_company_id')
+    
+    await update_company_field(company_id, 'city', message.text)
+    
+    company_info = await get_company_info(company_id)
+    text = (
+        f"{company_info['name']}\n"
+        f"{company_info['city']}\n\n"
+        f"Приветствие гостя:\n"
+        f"{company_info['welcome_message']}\n\n"
+        f"* в данном разделе вы можете менять настройки вашей компании"
+    )
+    await message.answer(text, reply_markup=get_company_cabinet_keyboard(company_info))
+    await state.clear()
+
+@dp.callback_query(F.data == "edit_company_welcome")
+async def edit_company_welcome(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "Вы редактируете кнопку\n\nВведите приветствие кнопки:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="company_cabinet")],
+            [InlineKeyboardButton(text="⏭ Пропустить", callback_data="company_cabinet")]
+        ])
+    )
+    await state.set_state(CompanyStates.editing_company_welcome)
+    await callback.answer()
+
+@dp.message(CompanyStates.editing_company_welcome)
+async def process_edit_company_welcome(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    company_id = data.get('current_company_id')
+    
+    await update_company_field(company_id, 'welcome_message', message.text)
+    
+    company_info = await get_company_info(company_id)
+    text = (
+        f"{company_info['name']}\n"
+        f"{company_info['city']}\n\n"
+        f"Приветствие гостя:\n"
+        f"{company_info['welcome_message']}\n\n"
+        f"* в данном разделе вы можете менять настройки вашей компании"
+    )
+    await message.answer(text, reply_markup=get_company_cabinet_keyboard(company_info))
+    await state.clear()
+
+@dp.callback_query(F.data == "edit_company_timezone")
+async def edit_company_timezone(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "Вы редактируете кнопку\n\nЗадаем часовой пояс компании. Параметр необходим для правильной работы бота с гостями.\n\n* Указываем смещение от МСК в МИНУТАХ",
+        reply_markup=get_back_keyboard("company_cabinet")
+    )
+    await state.set_state(CompanyStates.waiting_timezone)
+    await callback.answer()
+
+@dp.message(CompanyStates.waiting_timezone)
+async def process_edit_timezone(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    company_id = data.get('current_company_id')
+    
+    try:
+        timezone_offset = int(message.text)
+        await update_company_field(company_id, 'timezone_offset', timezone_offset)
+        
+        company_info = await get_company_info(company_id)
+        text = (
+            f"{company_info['name']}\n"
+            f"{company_info['city']}\n\n"
+            f"Приветствие гостя:\n"
+            f"{company_info['welcome_message']}\n\n"
+            f"* в данном разделе вы можете менять настройки вашей компании"
+        )
+        await message.answer(text, reply_markup=get_company_cabinet_keyboard(company_info))
+        await state.clear()
+    except ValueError:
+        await message.answer("Пожалуйста, введите число (смещение в минутах)")
+
+@dp.callback_query(F.data == "edit_checkin_time")
+async def edit_checkin_time(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "Вы редактируете кнопку\n\nВведите время заезда в формате 12:00:",
+        reply_markup=get_back_keyboard("company_cabinet")
+    )
+    await state.set_state(CompanyStates.waiting_checkin_time)
+    await callback.answer()
+
+@dp.message(CompanyStates.waiting_checkin_time)
+async def process_edit_checkin_time(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    company_id = data.get('current_company_id')
+    
+    await update_company_field(company_id, 'checkin_time', message.text)
+    
+    company_info = await get_company_info(company_id)
+    text = (
+        f"{company_info['name']}\n"
+        f"{company_info['city']}\n\n"
+        f"Приветствие гостя:\n"
+        f"{company_info['welcome_message']}\n\n"
+        f"* в данном разделе вы можете менять настройки вашей компании"
+    )
+    await message.answer(text, reply_markup=get_company_cabinet_keyboard(company_info))
+    await state.clear()
+
+@dp.callback_query(F.data == "edit_checkout_time")
+async def edit_checkout_time(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "Вы редактируете кнопку\n\nВведите время выезда в формате 12:00:",
+        reply_markup=get_back_keyboard("company_cabinet")
+    )
+    await state.set_state(CompanyStates.waiting_checkout_time)
+    await callback.answer()
+
+@dp.message(CompanyStates.waiting_checkout_time)
+async def process_edit_checkout_time(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    company_id = data.get('current_company_id')
+    
+    await update_company_field(company_id, 'checkout_time', message.text)
+    
+    company_info = await get_company_info(company_id)
+    text = (
+        f"{company_info['name']}\n"
+        f"{company_info['city']}\n\n"
+        f"Приветствие гостя:\n"
+        f"{company_info['welcome_message']}\n\n"
+        f"* в данном разделе вы можете менять настройки вашей компании"
+    )
+    await message.answer(text, reply_markup=get_company_cabinet_keyboard(company_info))
+    await state.clear()
+
+@dp.callback_query(F.data == "toggle_long_term")
+async def toggle_long_term(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    company_id = data.get('current_company_id')
+    
+    async with db_pool.acquire() as conn:
+        await conn.execute('''
+            UPDATE companies 
+            SET long_term_only = NOT long_term_only 
+            WHERE id = $1
+        ''', company_id)
+    
+    company_info = await get_company_info(company_id)
+    text = (
+        f"{company_info['name']}\n"
+        f"{company_info['city']}\n\n"
+        f"Приветствие гостя:\n"
+        f"{company_info['welcome_message']}\n\n"
+        f"* в данном разделе вы можете менять настройки вашей компании"
+    )
+    await callback.message.edit_text(text, reply_markup=get_company_cabinet_keyboard(company_info))
+    await callback.answer()
+
+@dp.callback_query(F.data == "invite_manager")
+async def invite_manager(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    company_id = data.get('current_company_id')
+    
+    # Генерируем ссылку для приглашения менеджера
+    bot_username = (await bot.get_me()).username
+    invite_link = f"https://t.me/{bot_username}?start=organization_q0lnvnpr9k"
+    
+    text = (
+        f"Ссылка для приглашения менеджера в компанию, по-умолчанию менеджер не может удалять объекты:\n"
+        f"{invite_link}"
+    )
+    
+    await callback.message.answer(text)
+    await callback.answer()
+
+@dp.callback_query(F.data == "managers_list")
+async def managers_list(callback: types.CallbackQuery, state: FSMContext):
+    text = (
+        "Вы на странице менеджеров. Ниже вы можете видеть сотрудников вашей компании. "
+        "Здесь вы можете назначить менеджера администратором и дать ему возможность удалять объекты.\n\n"
+        "У вас нет приглашённых менеджеров"
+    )
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Пригласить менеджера", callback_data="invite_manager")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="company_cabinet")]
+    ])
+    
+    await callback.message.edit_text(text, reply_markup=keyboard)
     await callback.answer()
 
 # Меню объектов
@@ -816,7 +1123,7 @@ async def subsection_stores(callback: types.CallbackQuery):
 async def section_experiences(callback: types.CallbackQuery):
     property_id = int(callback.data.split("_")[2])
     await callback.message.edit_text(
-        "Раздел: Впечатления",
+        "Вы на странице категории 🍿 Впечатления",
         reply_markup=get_experiences_section_keyboard(property_id)
     )
     await callback.answer()
@@ -825,7 +1132,7 @@ async def section_experiences(callback: types.CallbackQuery):
 async def section_checkout(callback: types.CallbackQuery):
     property_id = int(callback.data.split("_")[2])
     await callback.message.edit_text(
-        "Раздел: Выселение",
+        "Вы на странице категории 📦 Выселение",
         reply_markup=get_checkout_section_keyboard(property_id)
     )
     await callback.answer()
@@ -952,12 +1259,12 @@ async def process_custom_button_content(message: types.Message, state: FSMContex
     elif section == "rent":
         keyboard = get_rent_section_keyboard(property_id)
         text = "Вы на странице категории 📹 Аренда"
-    elif section == "experiences":
+    elif section == "exp":
         keyboard = get_experiences_section_keyboard(property_id)
-        text = "Раздел: Впечатления"
+        text = "Вы на странице категории 🍿 Впечатления"
     elif section == "checkout":
         keyboard = get_checkout_section_keyboard(property_id)
-        text = "Раздел: Выселение"
+        text = "Вы на странице категории 📦 Выселение"
     else:
         keyboard = get_checkin_section_keyboard(property_id)
         text = "Вы на странице категории 🧳 Заселение"
@@ -1006,10 +1313,10 @@ async def process_field_content(message: types.Message, state: FSMContext):
         text = "Вы на странице категории 📹 Аренда"
     elif section == "experiences":
         keyboard = get_experiences_section_keyboard(property_id)
-        text = "Раздел: Впечатления"
+        text = "Вы на странице категории 🍿 Впечатления"
     elif section == "checkout":
         keyboard = get_checkout_section_keyboard(property_id)
-        text = "Раздел: Выселение"
+        text = "Вы на странице категории 📦 Выселение"
     else:
         keyboard = get_checkin_section_keyboard(property_id)
         text = "Вы на странице категории 🧳 Заселение"
@@ -1034,10 +1341,10 @@ async def skip_field(callback: types.CallbackQuery, state: FSMContext):
         text = "Вы на странице категории 📹 Аренда"
     elif section == "experiences":
         keyboard = get_experiences_section_keyboard(property_id)
-        text = "Раздел: Впечатления"
+        text = "Вы на странице категории 🍿 Впечатления"
     elif section == "checkout":
         keyboard = get_checkout_section_keyboard(property_id)
-        text = "Раздел: Выселение"
+        text = "Вы на странице категории 📦 Выселение"
     else:
         keyboard = get_checkin_section_keyboard(property_id)
         text = "Вы на странице категории 🧳 Заселение"
@@ -1191,44 +1498,121 @@ async def complete_booking_handler(callback: types.CallbackQuery):
 
 # Предпросмотр объекта
 @dp.callback_query(F.data.startswith("preview_"))
-async def preview_property(callback: types.CallbackQuery):
+async def preview_property(callback: types.CallbackQuery, state: FSMContext):
     property_id = int(callback.data.split("_")[1])
+    
+    # Переводим в режим предпросмотра (режим гостя)
+    await state.update_data(preview_mode=True, preview_property_id=property_id)
+    
     property_name = await get_property_name(property_id)
     
+    async with db_pool.acquire() as conn:
+        address = await conn.fetchval('SELECT address FROM properties WHERE id = $1', property_id)
+    
+    text = f"{property_name}\n\nАдрес апартаментов: {address if address else 'MOСква'}.\n\nВот информация, доступная для изучения:"
+    
+    # Получаем все разделы которые есть в базе для этого объекта
     sections_data = await get_property_sections_data(property_id)
     
-    if not sections_data:
-        await callback.answer("Нет данных для предпросмотра", show_alert=True)
+    # Группируем по секциям
+    available_sections = set()
+    for row in sections_data:
+        available_sections.add(row['section'])
+    
+    # Создаем кнопки для доступных разделов
+    buttons = []
+    if 'rent' in available_sections:
+        buttons.append([InlineKeyboardButton(text="📹 Аренда", callback_data=f"preview_section_rent_{property_id}")])
+    if 'checkin' in available_sections:
+        buttons.append([InlineKeyboardButton(text="🧳 Заселение", callback_data=f"preview_section_checkin_{property_id}")])
+    if 'experiences' in available_sections:
+        buttons.append([InlineKeyboardButton(text="🍿 Впечатления", callback_data=f"preview_section_experiences_{property_id}")])
+    
+    buttons.append([InlineKeyboardButton(text="Переключится в режим владельца бота", callback_data=f"exit_preview_{property_id}")])
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("preview_section_"))
+async def preview_section(callback: types.CallbackQuery):
+    """Предпросмотр раздела с полями в виде кнопок"""
+    parts = callback.data.split("_")
+    section = parts[2]
+    property_id = int(parts[3])
+    
+    # Получаем все поля раздела
+    fields = await get_section_fields(property_id, section)
+    
+    if not fields:
+        await callback.answer("В этом разделе пока нет информации", show_alert=True)
         return
     
-    # Группируем по секциям
-    sections = {}
-    for row in sections_data:
-        section = row['section']
-        if section not in sections:
-            sections[section] = []
-        sections[section].append(row)
+    # Формируем текст
+    section_name = SECTION_NAMES.get(section, section)
+    section_icon = SECTION_ICONS.get(section, "📄")
     
-    text = f"Предпросмотр объекта: {property_name}\n\n"
+    text = f"Вы на странице категории {section_icon} {section_name}"
     
-    section_names = {
-        'checkin': '🧳 Заселение',
-        'help': '🏠 Помощь с проживанием',
-        'experiences': '🍿 Впечатления',
-        'checkout': '📦 Выселение'
-    }
+    # Создаем кнопки для каждого поля
+    buttons = []
+    for field in fields:
+        field_name = field['field_name']
+        buttons.append([InlineKeyboardButton(text=field_name, callback_data=f"preview_field_{property_id}_{section}_{field['field_key']}")])
     
-    for section_key, items in sections.items():
-        text += f"\n{section_names.get(section_key, section_key)}:\n"
-        for item in items:
-            text += f"• {item['field_name']}: "
-            if item['text_content']:
-                text += item['text_content'][:50] + ("..." if len(item['text_content']) > 50 else "")
-            if item['file_id']:
-                text += f" [{item['file_type']}]"
-            text += "\n"
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"preview_{property_id}")])
     
-    await callback.message.answer(text)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("preview_field_"))
+async def preview_field(callback: types.CallbackQuery):
+    """Показать содержимое конкретного поля в предпросмотре"""
+    parts = callback.data.split("_")
+    property_id = int(parts[2])
+    section = parts[3]
+    field_key = "_".join(parts[4:])
+    
+    field_data = await get_property_field(property_id, section, field_key)
+    
+    if not field_data:
+        await callback.answer("Нет данных для этого поля", show_alert=True)
+        return
+    
+    text_content = field_data['text_content']
+    file_id = field_data['file_id']
+    file_type = field_data['file_type']
+    
+    # Отправляем содержимое
+    if file_id:
+        try:
+            if file_type == "photo":
+                await callback.message.answer_photo(file_id, caption=text_content or "")
+            elif file_type == "video":
+                await callback.message.answer_video(file_id, caption=text_content or "")
+            elif file_type == "document":
+                await callback.message.answer_document(file_id, caption=text_content or "")
+        except Exception as e:
+            logger.error(f"Error sending media: {e}")
+            if text_content:
+                await callback.message.answer(text_content)
+    elif text_content:
+        await callback.message.answer(text_content)
+    
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("exit_preview_"))
+async def exit_preview(callback: types.CallbackQuery, state: FSMContext):
+    """Выход из режима предпросмотра"""
+    property_id = int(callback.data.split("_")[2])
+    await state.update_data(preview_mode=False)
+    
+    property_name = await get_property_name(property_id)
+    text = f"Вы на странице объекта {property_name}.\n\nТут вы можете отредактировать информацию о объекте, которая будет доступна гостям."
+    await callback.message.edit_text(text, reply_markup=get_property_menu_keyboard(property_id))
     await callback.answer()
 
 # Удаление объекта
@@ -1264,7 +1648,7 @@ async def delete_property_confirmed(callback: types.CallbackQuery, state: FSMCon
 
 # Переключение долгосрок/краткосрок
 @dp.callback_query(F.data.startswith("toggle_shortterm_"))
-async def toggle_shortterm(callback: types.CallbackQuery):
+async def toggle_shortterm_handler(callback: types.CallbackQuery):
     property_id = int(callback.data.split("_")[2])
     await toggle_short_term(property_id)
     
@@ -1290,11 +1674,6 @@ async def generate_owner_link(callback: types.CallbackQuery):
     await callback.message.answer(text, reply_markup=keyboard)
     await callback.answer()
 
-# Заглушки
-@dp.callback_query(F.data.in_(["connect_calendar", "guest_check", "feedback", "company_cabinet"]))
-async def placeholder(callback: types.CallbackQuery):
-    await callback.answer("Функция в разработке", show_alert=True)
-
 # Режим гостя
 @dp.callback_query(F.data.startswith("guest_start_"))
 async def guest_start(callback: types.CallbackQuery, state: FSMContext):
@@ -1307,17 +1686,33 @@ async def guest_start(callback: types.CallbackQuery, state: FSMContext):
     
     text = f"{property_name}\n\nВот информация, доступная для изучения:"
     
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🧳 Заселение", callback_data=f"guest_section_checkin_{property_id}")],
-        [InlineKeyboardButton(text="Переключится в режим владельца бота", callback_data="switch_to_owner")]
-    ])
+    # Получаем все разделы которые есть в базе для этого объекта
+    sections_data = await get_property_sections_data(property_id)
+    
+    # Группируем по секциям
+    available_sections = set()
+    for row in sections_data:
+        available_sections.add(row['section'])
+    
+    # Создаем кнопки для доступных разделов
+    buttons = []
+    if 'checkin' in available_sections:
+        buttons.append([InlineKeyboardButton(text="🧳 Заселение", callback_data=f"guest_section_checkin_{property_id}")])
+    if 'rent' in available_sections:
+        buttons.append([InlineKeyboardButton(text="📹 Аренда", callback_data=f"guest_section_rent_{property_id}")])
+    if 'experiences' in available_sections:
+        buttons.append([InlineKeyboardButton(text="🍿 Впечатления", callback_data=f"guest_section_experiences_{property_id}")])
+    
+    buttons.append([InlineKeyboardButton(text="Переключится в режим владельца бота", callback_data="switch_to_owner")])
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     
     await callback.message.edit_text(text, reply_markup=keyboard)
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("guest_section_"))
 async def guest_view_section(callback: types.CallbackQuery):
-    """Показать раздел для гостя"""
+    """Показать раздел для гостя с полями в виде кнопок"""
     parts = callback.data.split("_")
     section = parts[2]
     property_id = int(parts[3])
@@ -1329,37 +1724,58 @@ async def guest_view_section(callback: types.CallbackQuery):
         await callback.answer("В этом разделе пока нет информации", show_alert=True)
         return
     
-    # Формируем сообщение с информацией
-    property_name = await get_property_name(property_id)
-    text = f"{property_name}\n\n"
+    # Формируем кнопки для каждого поля
+    section_name = SECTION_NAMES.get(section, section)
+    section_icon = SECTION_ICONS.get(section, "📄")
     
+    text = f"Вы на странице категории {section_icon} {section_name}"
+    
+    buttons = []
     for field in fields:
         field_name = field['field_name']
-        text_content = field['text_content']
-        file_id = field['file_id']
-        file_type = field['file_type']
-        
-        text += f"\n📌 {field_name}\n"
-        if text_content:
-            text += f"{text_content}\n"
-        
-        # Отправляем медиа файлы отдельно
-        if file_id:
-            try:
-                if file_type == "photo":
-                    await callback.message.answer_photo(file_id, caption=field_name)
-                elif file_type == "video":
-                    await callback.message.answer_video(file_id, caption=field_name)
-                elif file_type == "document":
-                    await callback.message.answer_document(file_id, caption=field_name)
-            except Exception as e:
-                logger.error(f"Error sending media: {e}")
+        buttons.append([InlineKeyboardButton(text=field_name, callback_data=f"guest_field_{property_id}_{section}_{field['field_key']}")])
     
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"guest_start_{property_id}")]
-    ])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"guest_start_{property_id}")])
     
-    await callback.message.answer(text, reply_markup=keyboard)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("guest_field_"))
+async def guest_view_field(callback: types.CallbackQuery):
+    """Показать содержимое поля гостю"""
+    parts = callback.data.split("_")
+    property_id = int(parts[2])
+    section = parts[3]
+    field_key = "_".join(parts[4:])
+    
+    field_data = await get_property_field(property_id, section, field_key)
+    
+    if not field_data:
+        await callback.answer("Нет данных для этого поля", show_alert=True)
+        return
+    
+    text_content = field_data['text_content']
+    file_id = field_data['file_id']
+    file_type = field_data['file_type']
+    
+    # Отправляем содержимое
+    if file_id:
+        try:
+            if file_type == "photo":
+                await callback.message.answer_photo(file_id, caption=text_content or "")
+            elif file_type == "video":
+                await callback.message.answer_video(file_id, caption=text_content or "")
+            elif file_type == "document":
+                await callback.message.answer_document(file_id, caption=text_content or "")
+        except Exception as e:
+            logger.error(f"Error sending media: {e}")
+            if text_content:
+                await callback.message.answer(text_content)
+    elif text_content:
+        await callback.message.answer(text_content)
+    
     await callback.answer()
 
 @dp.callback_query(F.data == "switch_to_owner")
@@ -1384,28 +1800,6 @@ async def switch_to_owner_mode(callback: types.CallbackQuery, state: FSMContext)
         )
     
     await callback.answer("Переключено в режим владельца")
-
-# Обработчики для /podelu
-@dp.callback_query(F.data.startswith("podelu_"))
-async def podelu_handlers(callback: types.CallbackQuery):
-    """Заглушки для функций раздела /podelu"""
-    action = callback.data.replace("podelu_", "")
-    
-    messages = {
-        "find": "Функция поиска новой квартиры в разработке",
-        "accountant": "Свяжитесь с бухгалтером через @mir_any",
-        "purchase": "Функция общих закупок в разработке",
-        "exchange": "Функция обмена гостями в разработке",
-        "lawyer": "Свяжитесь с юристом через @mir_any",
-        "location": "Функция поиска локаций в разработке",
-        "furnish": "Функция обустройства квартир в разработке",
-        "invest": "Функция инвестирования в разработке",
-        "books": "Функция полезных книг в разработке",
-        "psychology": "Функция психологии в разработке",
-        "join": "Для вступления в #чатаподелу обратитесь к @mir_any"
-    }
-    
-    await callback.answer(messages.get(action, "В разработке"), show_alert=True)
 
 # Запуск бота
 async def on_shutdown():
