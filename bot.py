@@ -21,8 +21,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Токен бота
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8376900263:AAGQLHq9dveqe_polSjWzw8UBfVVrV0eh0A")
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:PECPoXHNBUxpIFYoQXVrQaLqSqpRbSYk@postgres.railway.internal:5432/railway")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8232122685:AAGvUGaYfQPkrX0l107UogvGz6n6yWJ_OQs")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:lGmnVeXVJlsynNhcfVhrsYBValEzJQvl@postgres.railway.internal:5432/railway")
 
 # Инициализация бота
 bot = Bot(token=BOT_TOKEN)
