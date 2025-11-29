@@ -712,6 +712,99 @@ SECTION_NAMES = {
     'checkout': 'Выселение'
 }
 
+# ============================================
+# КОМАНДЫ ДЛЯ БЫСТРОГО ДОСТУПА
+# ============================================
+
+@dp.message(Command("menu"))
+async def cmd_menu(message: types.Message, state: FSMContext):
+    """Команда /menu - главное меню"""
+    data = await state.get_data()
+    company_id = data.get('current_company_id')
+    
+    # Автоматически устанавливаем company_id если его нет
+    if not company_id:
+        companies = await get_user_companies(message.from_user.id)
+        if companies:
+            company_id = companies[0][0]
+            await state.update_data(current_company_id=company_id)
+    
+    await message.answer(
+        "Главное меню.\n\nЗдесь вы можете настроить свою компанию и добавить объекты недвижимости.",
+        reply_markup=get_main_menu_keyboard()
+    )
+
+@dp.message(Command("company"))
+async def cmd_company(message: types.Message, state: FSMContext):
+    """Команда /company - личный кабинет компании"""
+    data = await state.get_data()
+    company_id = data.get('current_company_id')
+    
+    # Автоматически устанавливаем company_id если его нет
+    if not company_id:
+        companies = await get_user_companies(message.from_user.id)
+        if companies:
+            company_id = companies[0][0]
+            await state.update_data(current_company_id=company_id)
+        else:
+            await message.answer(
+                "❌ Сначала создайте компанию.\n\nИспользуйте /start для начала работы.",
+                reply_markup=get_add_company_keyboard()
+            )
+            return
+    
+    company_info = await get_company_info(company_id)
+    
+    if company_info:
+        text = (
+            f"{company_info['name']}\n"
+            f"{company_info['city']}\n\n"
+            f"Приветствие гостя:\n"
+            f"{company_info['welcome_message']}\n\n"
+            f"* в данном разделе вы можете менять настройки вашей компании"
+        )
+        await message.answer(text, reply_markup=get_company_cabinet_keyboard(company_info))
+    else:
+        await message.answer(
+            "❌ Компания не найдена.\n\nИспользуйте /start для начала работы.",
+            reply_markup=get_add_company_keyboard()
+        )
+
+@dp.message(Command("apartments"))
+async def cmd_apartments(message: types.Message, state: FSMContext):
+    """Команда /apartments - список объектов и их редактирование"""
+    data = await state.get_data()
+    company_id = data.get('current_company_id')
+    
+    # Автоматически устанавливаем company_id если его нет
+    if not company_id:
+        companies = await get_user_companies(message.from_user.id)
+        if companies:
+            company_id = companies[0][0]
+            await state.update_data(current_company_id=company_id)
+        else:
+            await message.answer(
+                "❌ Сначала создайте компанию.\n\nИспользуйте /start для начала работы.",
+                reply_markup=get_add_company_keyboard()
+            )
+            return
+    
+    properties = await get_company_properties(company_id)
+    
+    if properties:
+        count_text = f"📊 Всего объектов: {len(properties)}"
+    else:
+        count_text = "📭 У вас пока нет объектов"
+    
+    await message.answer(
+        f"Вот список ваших объектов. Здесь вы можете добавлять и редактировать их.\n\n{count_text}",
+        reply_markup=get_objects_list_keyboard(properties)
+    )
+
+# ============================================
+# КОМАНДА /START
+# ============================================
+
 # Обработчик команды /start
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
@@ -2265,6 +2358,22 @@ async def main():
     
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, signal_handler)
+    
+    # Установка команд бота для отображения в меню Telegram
+    from aiogram.types import BotCommand
+    
+    commands = [
+        BotCommand(command="start", description="🚀 Запустить бота"),
+        BotCommand(command="menu", description="🏠 Главное меню"),
+        BotCommand(command="company", description="🏢 Личный кабинет компании"),
+        BotCommand(command="apartments", description="🏘️ Список объектов")
+    ]
+    
+    try:
+        await bot.set_my_commands(commands)
+        logger.info("✅ Bot commands set successfully")
+    except Exception as e:
+        logger.error(f"⚠️ Failed to set bot commands: {e}")
     
     # Запуск polling
     try:
