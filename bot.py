@@ -32,6 +32,15 @@ dp = Dispatcher(storage=storage)
 # Глобальный пул соединений
 db_pool: Optional[asyncpg.Pool] = None
 
+# Helper функция для безопасной очистки state
+async def clear_state_keep_company(state: FSMContext):
+    """Очищает state, но сохраняет current_company_id"""
+    data = await state.get_data()
+    company_id = data.get('current_company_id')
+    await state.clear()
+    if company_id:
+        await state.update_data(current_company_id=company_id)
+
 # Allowlist для безопасных полей компании (защита от SQL injection)
 ALLOWED_COMPANY_FIELDS = {
     'name', 'city', 'welcome_message', 'timezone_offset', 
@@ -819,13 +828,17 @@ async def process_company_city(message: types.Message, state: FSMContext):
     company_city = message.text
     
     company_id = await create_company(company_name, company_city, message.from_user.id)
+    
+    # ИСПРАВЛЕНО: Сохраняем company_id в state ПЕРЕД clear()
     await state.update_data(current_company_id=company_id)
     
     await message.answer(
         f"Отлично! Компания создана.\n\nНазвание: {company_name}\nГород: {company_city}",
         reply_markup=get_main_menu_keyboard()
     )
-    await state.clear()
+    
+    # Очищаем только временные данные, оставляем current_company_id
+    await state.set_data({'current_company_id': company_id})
 
 # Главное меню
 @dp.callback_query(F.data == "main_menu")
@@ -844,6 +857,7 @@ async def company_cabinet(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     company_id = data.get('current_company_id')
     
+    # ИСПРАВЛЕНО: Если компания не выбрана, пытаемся получить первую компанию пользователя
     if not company_id:
         companies = await get_user_companies(callback.from_user.id)
         if companies:
@@ -854,7 +868,7 @@ async def company_cabinet(callback: types.CallbackQuery, state: FSMContext):
                 "Сначала создайте компанию",
                 reply_markup=get_add_company_keyboard()
             )
-            await callback.answer()
+            await callback.answer("⚠️ Сначала создайте компанию", show_alert=True)
             return
     
     company_info = await get_company_info(company_id)
@@ -897,7 +911,9 @@ async def process_edit_company_name(message: types.Message, state: FSMContext):
         f"* в данном разделе вы можете менять настройки вашей компании"
     )
     await message.answer(text, reply_markup=get_company_cabinet_keyboard(company_info))
-    await state.clear()
+    
+    # ИСПРАВЛЕНО: Сохраняем company_id в state
+    await state.set_data({'current_company_id': company_id})
 
 @dp.callback_query(F.data == "edit_company_city")
 async def edit_company_city(callback: types.CallbackQuery, state: FSMContext):
@@ -924,7 +940,7 @@ async def process_edit_company_city(message: types.Message, state: FSMContext):
         f"* в данном разделе вы можете менять настройки вашей компании"
     )
     await message.answer(text, reply_markup=get_company_cabinet_keyboard(company_info))
-    await state.clear()
+    await clear_state_keep_company(state)
 
 @dp.callback_query(F.data == "edit_company_welcome")
 async def edit_company_welcome(callback: types.CallbackQuery, state: FSMContext):
@@ -954,7 +970,7 @@ async def process_edit_company_welcome(message: types.Message, state: FSMContext
         f"* в данном разделе вы можете менять настройки вашей компании"
     )
     await message.answer(text, reply_markup=get_company_cabinet_keyboard(company_info))
-    await state.clear()
+    await clear_state_keep_company(state)
 
 @dp.callback_query(F.data == "edit_company_timezone")
 async def edit_company_timezone(callback: types.CallbackQuery, state: FSMContext):
@@ -983,7 +999,7 @@ async def process_edit_timezone(message: types.Message, state: FSMContext):
             f"* в данном разделе вы можете менять настройки вашей компании"
         )
         await message.answer(text, reply_markup=get_company_cabinet_keyboard(company_info))
-        await state.clear()
+        await clear_state_keep_company(state)
     except ValueError:
         await message.answer("Пожалуйста, введите число (смещение в минутах)")
 
@@ -1012,7 +1028,7 @@ async def process_edit_checkin_time(message: types.Message, state: FSMContext):
         f"* в данном разделе вы можете менять настройки вашей компании"
     )
     await message.answer(text, reply_markup=get_company_cabinet_keyboard(company_info))
-    await state.clear()
+    await clear_state_keep_company(state)
 
 @dp.callback_query(F.data == "edit_checkout_time")
 async def edit_checkout_time(callback: types.CallbackQuery, state: FSMContext):
@@ -1039,7 +1055,7 @@ async def process_edit_checkout_time(message: types.Message, state: FSMContext):
         f"* в данном разделе вы можете менять настройки вашей компании"
     )
     await message.answer(text, reply_markup=get_company_cabinet_keyboard(company_info))
-    await state.clear()
+    await clear_state_keep_company(state)
 
 @dp.callback_query(F.data == "toggle_long_term")
 async def toggle_long_term(callback: types.CallbackQuery, state: FSMContext):
@@ -1131,9 +1147,19 @@ async def objects_menu(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     company_id = data.get('current_company_id')
     
+    # ИСПРАВЛЕНО: Если компания не выбрана, пытаемся получить первую компанию пользователя
     if not company_id:
-        await callback.answer("Ошибка: компания не выбрана", show_alert=True)
-        return
+        companies = await get_user_companies(callback.from_user.id)
+        if companies:
+            company_id = companies[0][0]
+            await state.update_data(current_company_id=company_id)
+        else:
+            await callback.message.edit_text(
+                "Сначала создайте компанию",
+                reply_markup=get_add_company_keyboard()
+            )
+            await callback.answer("⚠️ Сначала создайте компанию", show_alert=True)
+            return
     
     properties = await get_company_properties(company_id)
     await callback.message.edit_text(
@@ -1395,7 +1421,8 @@ async def process_field_content(message: types.Message, state: FSMContext):
         filled_stores = await get_filled_fields(property_id, 'stores')
         all_filled = filled_checkin | filled_help | filled_stores
         
-        keyboard = get_checkin_section_keyboard(property_id, all_filled)
+        # ИСПРАВЛЕНО: используем асинхронную функцию с await
+        keyboard = await get_checkin_section_keyboard_async(property_id, all_filled)
         text = "Вы на странице категории 🧳 Заселение"
     
     await message.answer(text, reply_markup=keyboard)
@@ -1407,23 +1434,34 @@ async def skip_field(callback: types.CallbackQuery, state: FSMContext):
     section = parts[2]
     property_id = int(parts[3])
     
+    # Получаем заполненные поля для правильного отображения индикаторов
     if section == "help":
-        keyboard = get_help_subsection_keyboard(property_id)
+        filled_fields = await get_filled_fields(property_id, 'help')
+        keyboard = get_help_subsection_keyboard(property_id, filled_fields)
         text = "Вы на странице категории 🏠 Помощь с проживанием"
     elif section == "stores":
-        keyboard = get_stores_subsection_keyboard(property_id)
+        filled_fields = await get_filled_fields(property_id, 'stores')
+        keyboard = get_stores_subsection_keyboard(property_id, filled_fields)
         text = "Вы на странице категории 📍 Магазины, аптеки итд."
     elif section == "rent":
-        keyboard = get_rent_section_keyboard(property_id)
+        filled_fields = await get_filled_fields(property_id, 'rent')
+        keyboard = get_rent_section_keyboard(property_id, filled_fields)
         text = "Вы на странице категории 📹 Аренда"
     elif section == "experiences":
-        keyboard = get_experiences_section_keyboard(property_id)
+        filled_fields = await get_filled_fields(property_id, 'experiences')
+        keyboard = get_experiences_section_keyboard(property_id, filled_fields)
         text = "Вы на странице категории 🍿 Впечатления"
     elif section == "checkout":
-        keyboard = get_checkout_section_keyboard(property_id)
+        filled_fields = await get_filled_fields(property_id, 'checkout')
+        keyboard = get_checkout_section_keyboard(property_id, filled_fields)
         text = "Вы на странице категории 📦 Выселение"
-    else:
-        keyboard = get_checkin_section_keyboard(property_id)
+    else:  # checkin
+        filled_checkin = await get_filled_fields(property_id, 'checkin')
+        filled_help = await get_filled_fields(property_id, 'help')
+        filled_stores = await get_filled_fields(property_id, 'stores')
+        all_filled = filled_checkin | filled_help | filled_stores
+        
+        keyboard = await get_checkin_section_keyboard_async(property_id, all_filled)
         text = "Вы на странице категории 🧳 Заселение"
     
     await callback.message.edit_text(text, reply_markup=keyboard)
