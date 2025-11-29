@@ -1290,19 +1290,27 @@ async def process_property_address(message: types.Message, state: FSMContext):
     
     property_id = await create_property(company_id, property_name, property_address)
     
+    # ИСПРАВЛЕНО: Сохраняем property_id но НЕ очищаем state (нужен company_id для confirm_save)
+    await state.update_data(pending_property_id=property_id)
+    
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💾 Сохранить", callback_data=f"confirm_save_{property_id}")],
         [InlineKeyboardButton(text="❌ Не сохранять", callback_data="objects_menu")]
     ])
     
     await message.answer("Сохранить объект?", reply_markup=keyboard)
-    await state.clear()
+    # НЕ очищаем state здесь!
 
 @dp.callback_query(F.data.startswith("confirm_save_"))
 async def confirm_save(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     company_id = data.get('current_company_id')
+    
+    # ИСПРАВЛЕНО: Сначала получаем список с правильным company_id
     properties = await get_company_properties(company_id)
+    
+    # Теперь можем очистить state, сохранив только company_id
+    await clear_state_keep_company(state)
     
     await callback.message.edit_text(
         "Вот список ваших объектов. Здесь вы можете добавлять и редактировать их.",
@@ -1318,13 +1326,16 @@ async def skip_address(callback: types.CallbackQuery, state: FSMContext):
     
     property_id = await create_property(company_id, property_name, "")
     
+    # ИСПРАВЛЕНО: Сохраняем property_id но НЕ очищаем state
+    await state.update_data(pending_property_id=property_id)
+    
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💾 Сохранить", callback_data=f"confirm_save_{property_id}")],
         [InlineKeyboardButton(text="❌ Не сохранять", callback_data="objects_menu")]
     ])
     
     await callback.message.edit_text("Сохранить объект?", reply_markup=keyboard)
-    await state.clear()
+    # НЕ очищаем state здесь!
     await callback.answer()
 
 # Просмотр объекта
