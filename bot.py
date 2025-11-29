@@ -21,8 +21,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Токен бота
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8232122685:AAGvUGaYfQPkrX0l107UogvGz6n6yWJ_OQs")
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:lGmnVeXVJlsynNhcfVhrsYBValEzJQvl@postgres.railway.internal:5432/railway")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8376900263:AAGQLHq9dveqe_polSjWzw8UBfVVrV0eh0A")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:PECPoXHNBUxpIFYoQXVrQaLqSqpRbSYk@postgres.railway.internal:5432/railway")
 
 # Инициализация бота
 bot = Bot(token=BOT_TOKEN)
@@ -123,6 +123,59 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT NOW()
             )
         ''')
+        
+        # МИГРАЦИИ для существующих баз данных
+        logger.info("Running database migrations...")
+        
+        # Миграция 1: Добавляем first_start в users (с проверкой существования)
+        try:
+            column_exists = await conn.fetchval('''
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.columns 
+                    WHERE table_name = 'users' AND column_name = 'first_start'
+                )
+            ''')
+            
+            if not column_exists:
+                await conn.execute('ALTER TABLE users ADD COLUMN first_start BOOLEAN DEFAULT TRUE')
+                logger.info("✅ Migration: Added first_start column to users")
+            else:
+                logger.info("ℹ️  first_start column already exists")
+        except Exception as e:
+            logger.error(f"❌ first_start migration failed: {e}")
+        
+        # Миграция 2: Добавляем invite_code в companies (с проверкой существования)
+        try:
+            column_exists = await conn.fetchval('''
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.columns 
+                    WHERE table_name = 'companies' AND column_name = 'invite_code'
+                )
+            ''')
+            
+            if not column_exists:
+                await conn.execute('ALTER TABLE companies ADD COLUMN invite_code TEXT')
+                logger.info("✅ Migration: Added invite_code column to companies")
+                
+                # Создаем уникальный индекс
+                await conn.execute('CREATE UNIQUE INDEX companies_invite_code_key ON companies(invite_code)')
+                logger.info("✅ Migration: Created unique index for invite_code")
+            else:
+                logger.info("ℹ️  invite_code column already exists")
+        except Exception as e:
+            logger.error(f"❌ invite_code migration failed: {e}")
+        
+        # Миграция 3: Генерируем invite_code для существующих компаний
+        try:
+            result = await conn.execute('''
+                UPDATE companies 
+                SET invite_code = md5(random()::text || id::text)
+                WHERE invite_code IS NULL
+            ''')
+            if result != 'UPDATE 0':
+                logger.info(f"✅ Migration: Generated invite codes ({result})")
+        except Exception as e:
+            logger.error(f"❌ generate invite_code migration failed: {e}")
         
         logger.info("Database initialized successfully")
 
@@ -327,6 +380,17 @@ async def get_property_address(property_id: int):
     async with db_pool.acquire() as conn:
         return await conn.fetchval('SELECT address FROM properties WHERE id = $1', property_id)
 
+async def get_company_managers(company_id: int):
+    """Получить список менеджеров компании"""
+    async with db_pool.acquire() as conn:
+        return await conn.fetch('''
+            SELECT u.user_id, u.username, u.first_name, uc.is_admin
+            FROM user_companies uc
+            JOIN users u ON uc.user_id = u.user_id
+            WHERE uc.company_id = $1
+            ORDER BY uc.is_admin DESC, u.first_name
+        ''', company_id)
+
 async def mark_user_not_first_start(user_id: int):
     async with db_pool.acquire() as conn:
         await conn.execute('UPDATE users SET first_start = FALSE WHERE user_id = $1', user_id)
@@ -471,41 +535,41 @@ def get_field_edit_keyboard(property_id: int, section: str):
         [InlineKeyboardButton(text="⏭ Пропустить", callback_data=f"skip_field_{section}_{property_id}")]
     ])
 
-# Маппинг полей
+# Маппинг полей с иконками (как на скриншотах)
 FIELD_NAMES = {
-    'checkin_time': 'Время заселения и выселения',
-    'parking': 'Парковка',
-    'wifi': 'Wi-Fi',
-    'door_key': 'Ключ от двери',
-    'how_to_find': 'Как найти объект?',
-    'how_to_reach': 'Как дойти до квартиры',
-    'documents': 'Документы для заселения',
-    'deposit': 'Депозит',
-    'remote_checkin': 'Дистанционное заселение',
-    'rules': 'Правила проживания',
-    'breakfast': 'Завтрак',
-    'linen': 'Поменять бельё',
-    'manager_contact': 'Связь с менеджером',
-    'tv_setup': 'Настройка ТВ',
-    'ac': 'Кондиционер',
-    'shops': 'Магазины',
-    'car_rental': 'Аренда машин',
-    'sport': 'Спорт',
-    'hospitals': 'Больницы',
-    'uk_phones': 'Телефоны УК',
-    'dispatcher': 'Телефон диспетчера',
-    'emergency': 'Телефон аварийной службы',
-    'chats': 'Домовые чаты',
-    'feedback_form': 'Форма обратной связи',
-    'internet': 'Интернет',
-    'excursions': 'Экскурсии',
-    'museums': 'Музеи',
-    'parks': 'Парки',
-    'entertainment': 'Кино и театры',
-    'self_checkout': 'Как выехать без менеджера?',
-    'deposit_return': 'Возврат депозита',
-    'extend_stay': 'Продлить проживание',
-    'discounts': 'Скидки'
+    'checkin_time': '🕐 Время заселения и выселения',
+    'parking': '🚗 Парковка',
+    'wifi': '📶 Wi-Fi',
+    'door_key': '🔑 Ключ от двери',
+    'how_to_find': '🗺️ Как найти объект?',
+    'how_to_reach': '🏢 Как дойти до квартиры',
+    'documents': '📄 Документы для заселения',
+    'deposit': '💰 Депозит',
+    'remote_checkin': '🔒 Дистанционное заселение',
+    'rules': '📋 Правила проживания',
+    'breakfast': '🥐 Завтрак',
+    'linen': '🛏 Поменять бельё',
+    'manager_contact': '📱 Связь с менеджером',
+    'tv_setup': '📺 Настройка ТВ',
+    'ac': '❄️ Кондиционер',
+    'shops': '🛒 Магазины',
+    'car_rental': '🚗 Аренда машин',
+    'sport': '🏃 Спорт',
+    'hospitals': '💊 Больницы',
+    'uk_phones': '🏢 Телефоны УК',
+    'dispatcher': '👤 Телефон диспетчера',
+    'emergency': '🆘 Телефон аварийной службы',
+    'chats': '💬 Домовые чаты',
+    'feedback_form': '📝 Форма обратной связи',
+    'internet': '🌐 Интернет',
+    'excursions': '🚌 Экскурсии',
+    'museums': '🏛️ Музеи',
+    'parks': '🖼️ Парки',
+    'entertainment': '🎭 Кино и театры',
+    'self_checkout': '🚪 Как выехать без менеджера?',
+    'deposit_return': '💸 Возврат депозита',
+    'extend_stay': '📅 Продлить проживание',
+    'discounts': '🎁 Скидки'
 }
 
 FIELD_DESCRIPTIONS = {
@@ -929,17 +993,48 @@ async def invite_manager(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
 
 @dp.callback_query(F.data == "managers_list")
-async def managers_list(callback: types.CallbackQuery):
+async def managers_list(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    company_id = data.get('current_company_id')
+    
+    if not company_id:
+        await callback.answer("Ошибка: компания не выбрана", show_alert=True)
+        return
+    
+    managers = await get_company_managers(company_id)
+    
     text = (
         "Вы на странице менеджеров. Ниже вы можете видеть сотрудников вашей компании. "
         "Здесь вы можете назначить менеджера администратором и дать ему возможность удалять объекты.\n\n"
-        "У вас нет приглашённых менеджеров"
     )
     
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Пригласить менеджера", callback_data="invite_manager")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="company_cabinet")]
-    ])
+    buttons = []
+    
+    if managers and len(managers) > 0:
+        text += "📋 Список менеджеров:\n\n"
+        for manager in managers:
+            username = manager['username'] or "Без username"
+            first_name = manager['first_name'] or "Без имени"
+            is_admin = manager['is_admin']
+            
+            role = "👑 Админ" if is_admin else "👤 Менеджер"
+            manager_text = f"{role} - {first_name} (@{username})"
+            
+            text += f"• {manager_text}\n"
+            
+            # Кнопка для каждого менеджера
+            button_text = f"{first_name} - {role}"
+            buttons.append([InlineKeyboardButton(
+                text=button_text,
+                callback_data=f"manage_user_{manager['user_id']}"
+            )])
+    else:
+        text += "У вас нет приглашённых менеджеров"
+    
+    buttons.append([InlineKeyboardButton(text="Пригласить менеджера", callback_data="invite_manager")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="company_cabinet")])
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     
     await callback.message.edit_text(text, reply_markup=keyboard)
     await callback.answer()
@@ -1548,7 +1643,11 @@ async def preview_section(callback: types.CallbackQuery):
     section_name = SECTION_NAMES.get(section, section)
     section_icon = SECTION_ICONS.get(section, "📄")
     
-    text = f"Вы на странице категории {section_icon} {section_name}"
+    # Добавляем сердечко к разделу Заселение как на скриншоте
+    if section == 'checkin':
+        text = f"Вы на странице категории {section_icon} {section_name} ❤️"
+    else:
+        text = f"Вы на странице категории {section_icon} {section_name}"
     
     buttons = []
     for field in fields:
@@ -1576,24 +1675,47 @@ async def preview_field(callback: types.CallbackQuery):
         await callback.answer("Нет данных для этого поля", show_alert=True)
         return
     
+    # Получаем название поля с иконкой
+    field_name = FIELD_NAMES.get(field_key, "Поле")
+    
     text_content = field_data['text_content']
     file_id = field_data['file_id']
     file_type = field_data['file_type']
     
+    # Формируем заголовок
+    header = f"Вы на странице {field_name}"
+    
+    # Кнопка "Назад"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Назад", callback_data=f"prevw_section_{section}_{property_id}")]
+    ])
+    
+    # Если есть файл - отправляем с caption
     if file_id:
         try:
+            caption = f"{header}\n\n{text_content}" if text_content else header
+            
             if file_type == "photo":
-                await callback.message.answer_photo(file_id, caption=text_content or "")
+                await callback.message.delete()
+                await callback.message.answer_photo(file_id, caption=caption, reply_markup=keyboard)
             elif file_type == "video":
-                await callback.message.answer_video(file_id, caption=text_content or "")
+                await callback.message.delete()
+                await callback.message.answer_video(file_id, caption=caption, reply_markup=keyboard)
             elif file_type == "document":
-                await callback.message.answer_document(file_id, caption=text_content or "")
+                await callback.message.delete()
+                await callback.message.answer_document(file_id, caption=caption, reply_markup=keyboard)
         except Exception as e:
             logger.error(f"Error sending media: {e}")
-            if text_content:
-                await callback.message.answer(text_content)
+            # Если не удалось отправить медиа, отправляем текстом
+            full_text = f"{header}\n\n{text_content}" if text_content else header
+            await callback.message.edit_text(full_text, reply_markup=keyboard)
     elif text_content:
-        await callback.message.answer(text_content)
+        # Только текст - показываем в одном сообщении
+        full_text = f"{header}\n\n{text_content}"
+        await callback.message.edit_text(full_text, reply_markup=keyboard)
+    else:
+        # Нет контента
+        await callback.message.edit_text(header, reply_markup=keyboard)
     
     await callback.answer()
 
@@ -1711,7 +1833,11 @@ async def guest_view_section(callback: types.CallbackQuery):
     section_name = SECTION_NAMES.get(section, section)
     section_icon = SECTION_ICONS.get(section, "📄")
     
-    text = f"Вы на странице категории {section_icon} {section_name}"
+    # Добавляем сердечко к разделу Заселение как на скриншоте
+    if section == 'checkin':
+        text = f"Вы на странице категории {section_icon} {section_name} ❤️"
+    else:
+        text = f"Вы на странице категории {section_icon} {section_name}"
     
     buttons = []
     for field in fields:
@@ -1738,24 +1864,47 @@ async def guest_view_field(callback: types.CallbackQuery):
         await callback.answer("Нет данных для этого поля", show_alert=True)
         return
     
+    # Получаем название поля с иконкой
+    field_name = FIELD_NAMES.get(field_key, "Поле")
+    
     text_content = field_data['text_content']
     file_id = field_data['file_id']
     file_type = field_data['file_type']
     
+    # Формируем заголовок
+    header = f"Вы на странице {field_name}"
+    
+    # Кнопка "Назад"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Назад", callback_data=f"guest_section_{section}_{property_id}")]
+    ])
+    
+    # Если есть файл - отправляем с caption
     if file_id:
         try:
+            caption = f"{header}\n\n{text_content}" if text_content else header
+            
             if file_type == "photo":
-                await callback.message.answer_photo(file_id, caption=text_content or "")
+                await callback.message.delete()
+                await callback.message.answer_photo(file_id, caption=caption, reply_markup=keyboard)
             elif file_type == "video":
-                await callback.message.answer_video(file_id, caption=text_content or "")
+                await callback.message.delete()
+                await callback.message.answer_video(file_id, caption=caption, reply_markup=keyboard)
             elif file_type == "document":
-                await callback.message.answer_document(file_id, caption=text_content or "")
+                await callback.message.delete()
+                await callback.message.answer_document(file_id, caption=caption, reply_markup=keyboard)
         except Exception as e:
             logger.error(f"Error sending media: {e}")
-            if text_content:
-                await callback.message.answer(text_content)
+            # Если не удалось отправить медиа, отправляем текстом
+            full_text = f"{header}\n\n{text_content}" if text_content else header
+            await callback.message.edit_text(full_text, reply_markup=keyboard)
     elif text_content:
-        await callback.message.answer(text_content)
+        # Только текст - показываем в одном сообщении
+        full_text = f"{header}\n\n{text_content}"
+        await callback.message.edit_text(full_text, reply_markup=keyboard)
+    else:
+        # Нет контента
+        await callback.message.edit_text(header, reply_markup=keyboard)
     
     await callback.answer()
 
