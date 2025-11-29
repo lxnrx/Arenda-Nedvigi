@@ -327,6 +327,35 @@ async def get_section_fields(property_id: int, section: str):
             ORDER BY field_name
         ''', property_id, section)
 
+async def get_filled_fields(property_id: int, section: str):
+    """Получить список заполненных полей раздела"""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch('''
+            SELECT field_key
+            FROM property_info
+            WHERE property_id = $1 AND section = $2
+            AND (text_content IS NOT NULL OR file_id IS NOT NULL)
+        ''', property_id, section)
+        return set(row['field_key'] for row in rows)
+
+async def get_custom_fields(property_id: int, section: str):
+    """Получить список кастомных полей раздела"""
+    async with db_pool.acquire() as conn:
+        return await conn.fetch('''
+            SELECT field_key, field_name, text_content, file_id, file_type
+            FROM property_info
+            WHERE property_id = $1 AND section = $2 AND field_key LIKE 'custom_%'
+            ORDER BY created_at
+        ''', property_id, section)
+
+async def delete_custom_field(property_id: int, section: str, field_key: str):
+    """Удалить кастомное поле"""
+    async with db_pool.acquire() as conn:
+        await conn.execute('''
+            DELETE FROM property_info
+            WHERE property_id = $1 AND section = $2 AND field_key = $3
+        ''', property_id, section, field_key)
+
 async def create_booking(property_id: int, guest_name: str, checkin_date):
     access_code = secrets.token_urlsafe(32)
     
@@ -379,6 +408,15 @@ async def get_property_name(property_id: int):
 async def get_property_address(property_id: int):
     async with db_pool.acquire() as conn:
         return await conn.fetchval('SELECT address FROM properties WHERE id = $1', property_id)
+
+async def get_property_info(property_id: int):
+    """Получить полную информацию об объекте"""
+    async with db_pool.acquire() as conn:
+        return await conn.fetchrow('''
+            SELECT id, name, address, is_short_term, company_id
+            FROM properties
+            WHERE id = $1
+        ''', property_id)
 
 async def get_company_managers(company_id: int):
     """Получить список менеджеров компании"""
@@ -443,14 +481,17 @@ def get_objects_list_keyboard(properties):
     
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_property_menu_keyboard(property_id: int):
+def get_property_menu_keyboard(property_id: int, is_short_term: bool = True):
+    # Определяем текст кнопки в зависимости от режима
+    term_button_text = "📅 Краткосрок" if is_short_term else "📅 Долгосрок"
+    
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🧳 Заселение", callback_data=f"section_checkin_{property_id}")],
         [InlineKeyboardButton(text="📹 Аренда", callback_data=f"section_rent_{property_id}")],
         [InlineKeyboardButton(text="🍿 Впечатления", callback_data=f"section_experiences_{property_id}")],
         [InlineKeyboardButton(text="📦 Выселение", callback_data=f"section_checkout_{property_id}")],
         [InlineKeyboardButton(text="🔗 Бронирования", callback_data=f"bookings_{property_id}")],
-        [InlineKeyboardButton(text="📅 Долгосрок", callback_data=f"toggle_shortterm_{property_id}")],
+        [InlineKeyboardButton(text=term_button_text, callback_data=f"toggle_shortterm_{property_id}")],
         [InlineKeyboardButton(text="Ссылка на объект для собственника", callback_data=f"owner_link_{property_id}")],
         [InlineKeyboardButton(text="Редактировать объект", callback_data=f"edit_property_{property_id}")],
         [InlineKeyboardButton(text="Предпросмотр объекта", callback_data=f"prop_preview_{property_id}")],
@@ -458,73 +499,118 @@ def get_property_menu_keyboard(property_id: int):
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="objects_menu")]
     ])
 
-def get_checkin_section_keyboard(property_id: int):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🕐 Время заселения и выселения", callback_data=f"field_checkin_time_{property_id}")],
-        [InlineKeyboardButton(text="🚗 Парковка", callback_data=f"field_parking_{property_id}")],
-        [InlineKeyboardButton(text="🌐 Wi-Fi", callback_data=f"field_wifi_{property_id}")],
-        [InlineKeyboardButton(text="🔑 Ключ от двери", callback_data=f"field_door_key_{property_id}")],
-        [InlineKeyboardButton(text="🗺 Как найти объект?", callback_data=f"field_how_to_find_{property_id}")],
-        [InlineKeyboardButton(text="🚶 Как дойти до квартиры", callback_data=f"field_how_to_reach_{property_id}")],
-        [InlineKeyboardButton(text="📄 Документы для заселения", callback_data=f"field_documents_{property_id}")],
-        [InlineKeyboardButton(text="💰 Депозит", callback_data=f"field_deposit_{property_id}")],
-        [InlineKeyboardButton(text="🔐 Дистанционное заселение", callback_data=f"field_remote_checkin_{property_id}")],
+async def get_checkin_section_keyboard_async(property_id: int, filled_fields: set = None):
+    """Асинхронная клавиатура раздела Заселение с кастомными кнопками"""
+    filled_fields = filled_fields or set()
+    
+    def field_text(name: str, key: str) -> str:
+        return f"{name} ■" if key in filled_fields else name
+    
+    buttons = [
+        [InlineKeyboardButton(text=field_text("🕐 Время заселения и выселения", "checkin_time"), callback_data=f"field_checkin_time_{property_id}")],
+        [InlineKeyboardButton(text=field_text("🚗 Парковка", "parking"), callback_data=f"field_parking_{property_id}")],
+        [InlineKeyboardButton(text=field_text("🌐 Wi-Fi", "wifi"), callback_data=f"field_wifi_{property_id}")],
+        [InlineKeyboardButton(text=field_text("🔑 Ключ от двери", "door_key"), callback_data=f"field_door_key_{property_id}")],
+        [InlineKeyboardButton(text=field_text("🗺 Как найти объект?", "how_to_find"), callback_data=f"field_how_to_find_{property_id}")],
+        [InlineKeyboardButton(text=field_text("🚶 Как дойти до квартиры", "how_to_reach"), callback_data=f"field_how_to_reach_{property_id}")],
+        [InlineKeyboardButton(text=field_text("📄 Документы для заселения", "documents"), callback_data=f"field_documents_{property_id}")],
+        [InlineKeyboardButton(text=field_text("💰 Депозит", "deposit"), callback_data=f"field_deposit_{property_id}")],
+        [InlineKeyboardButton(text=field_text("🔐 Дистанционное заселение", "remote_checkin"), callback_data=f"field_remote_checkin_{property_id}")],
         [InlineKeyboardButton(text="🏠 Помощь с проживанием", callback_data=f"subsection_help_{property_id}")],
         [InlineKeyboardButton(text="📍 Магазины, аптеки итд.", callback_data=f"subsection_stores_{property_id}")],
-        [InlineKeyboardButton(text="📢 Правила проживания", callback_data=f"field_rules_{property_id}")],
-        [InlineKeyboardButton(text="➕ Добавить кнопку", callback_data=f"add_custom_checkin_{property_id}")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"property_{property_id}")]
-    ])
+        [InlineKeyboardButton(text=field_text("📢 Правила проживания", "rules"), callback_data=f"field_rules_{property_id}")],
+    ]
+    
+    # Добавляем кастомные кнопки
+    custom_fields = await get_custom_fields(property_id, 'checkin')
+    for custom in custom_fields:
+        custom_name = field_text(custom['field_name'], custom['field_key'])
+        buttons.append([InlineKeyboardButton(text=custom_name, callback_data=f"custom_field_{property_id}_checkin_{custom['field_key']}")])
+    
+    buttons.append([InlineKeyboardButton(text="➕ Добавить кнопку", callback_data=f"add_custom_checkin_{property_id}")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"property_{property_id}")])
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_rent_section_keyboard(property_id: int):
+def get_rent_section_keyboard(property_id: int, filled_fields: set = None):
+    """Клавиатура раздела Аренда с индикаторами заполненности"""
+    filled_fields = filled_fields or set()
+    
+    def field_text(name: str, key: str) -> str:
+        return f"{name} ■" if key in filled_fields else name
+    
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📱 Телефоны УК", callback_data=f"field_uk_phones_{property_id}")],
-        [InlineKeyboardButton(text="👨‍💼 Телефон диспетчера", callback_data=f"field_dispatcher_{property_id}")],
-        [InlineKeyboardButton(text="🆘 Телефон аварийной службы", callback_data=f"field_emergency_{property_id}")],
-        [InlineKeyboardButton(text="💬 Домовые чаты", callback_data=f"field_chats_{property_id}")],
-        [InlineKeyboardButton(text="📝 Форма обратной связи", callback_data=f"field_feedback_form_{property_id}")],
-        [InlineKeyboardButton(text="🌐 Интернет", callback_data=f"field_internet_{property_id}")],
+        [InlineKeyboardButton(text=field_text("📱 Телефоны УК", "uk_phones"), callback_data=f"field_uk_phones_{property_id}")],
+        [InlineKeyboardButton(text=field_text("👨‍💼 Телефон диспетчера", "dispatcher"), callback_data=f"field_dispatcher_{property_id}")],
+        [InlineKeyboardButton(text=field_text("🆘 Телефон аварийной службы", "emergency"), callback_data=f"field_emergency_{property_id}")],
+        [InlineKeyboardButton(text=field_text("💬 Домовые чаты", "chats"), callback_data=f"field_chats_{property_id}")],
+        [InlineKeyboardButton(text=field_text("📝 Форма обратной связи", "feedback_form"), callback_data=f"field_feedback_form_{property_id}")],
+        [InlineKeyboardButton(text=field_text("🌐 Интернет", "internet"), callback_data=f"field_internet_{property_id}")],
         [InlineKeyboardButton(text="➕ Добавить кнопку", callback_data=f"add_custom_rent_{property_id}")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"property_{property_id}")]
     ])
 
-def get_help_subsection_keyboard(property_id: int):
+def get_help_subsection_keyboard(property_id: int, filled_fields: set = None):
+    """Клавиатура подраздела Помощь с проживанием"""
+    filled_fields = filled_fields or set()
+    
+    def field_text(name: str, key: str) -> str:
+        return f"{name} ■" if key in filled_fields else name
+    
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🥐 Завтрак", callback_data=f"field_breakfast_{property_id}")],
-        [InlineKeyboardButton(text="🛏 Поменять бельё", callback_data=f"field_linen_{property_id}")],
-        [InlineKeyboardButton(text="📱 Связь с менеджером", callback_data=f"field_manager_contact_{property_id}")],
-        [InlineKeyboardButton(text="📺 Настройка ТВ", callback_data=f"field_tv_setup_{property_id}")],
-        [InlineKeyboardButton(text="❄️ Кондиционер", callback_data=f"field_ac_{property_id}")],
+        [InlineKeyboardButton(text=field_text("🥐 Завтрак", "breakfast"), callback_data=f"field_breakfast_{property_id}")],
+        [InlineKeyboardButton(text=field_text("🛏 Поменять бельё", "linen"), callback_data=f"field_linen_{property_id}")],
+        [InlineKeyboardButton(text=field_text("📱 Связь с менеджером", "manager_contact"), callback_data=f"field_manager_contact_{property_id}")],
+        [InlineKeyboardButton(text=field_text("📺 Настройка ТВ", "tv_setup"), callback_data=f"field_tv_setup_{property_id}")],
+        [InlineKeyboardButton(text=field_text("❄️ Кондиционер", "ac"), callback_data=f"field_ac_{property_id}")],
         [InlineKeyboardButton(text="➕ Добавить кнопку", callback_data=f"add_custom_help_{property_id}")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"section_checkin_{property_id}")]
     ])
 
-def get_stores_subsection_keyboard(property_id: int):
+def get_stores_subsection_keyboard(property_id: int, filled_fields: set = None):
+    """Клавиатура подраздела Магазины, аптеки"""
+    filled_fields = filled_fields or set()
+    
+    def field_text(name: str, key: str) -> str:
+        return f"{name} ■" if key in filled_fields else name
+    
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🛒 Магазины", callback_data=f"field_shops_{property_id}")],
-        [InlineKeyboardButton(text="🚗 Аренда машин", callback_data=f"field_car_rental_{property_id}")],
-        [InlineKeyboardButton(text="🏃 Спорт", callback_data=f"field_sport_{property_id}")],
-        [InlineKeyboardButton(text="💊 Больницы", callback_data=f"field_hospitals_{property_id}")],
+        [InlineKeyboardButton(text=field_text("🛒 Магазины", "shops"), callback_data=f"field_shops_{property_id}")],
+        [InlineKeyboardButton(text=field_text("🚗 Аренда машин", "car_rental"), callback_data=f"field_car_rental_{property_id}")],
+        [InlineKeyboardButton(text=field_text("🏃 Спорт", "sport"), callback_data=f"field_sport_{property_id}")],
+        [InlineKeyboardButton(text=field_text("💊 Больницы", "hospitals"), callback_data=f"field_hospitals_{property_id}")],
         [InlineKeyboardButton(text="➕ Добавить кнопку", callback_data=f"add_custom_stores_{property_id}")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"section_checkin_{property_id}")]
     ])
 
-def get_experiences_section_keyboard(property_id: int):
+def get_experiences_section_keyboard(property_id: int, filled_fields: set = None):
+    """Клавиатура раздела Впечатления"""
+    filled_fields = filled_fields or set()
+    
+    def field_text(name: str, key: str) -> str:
+        return f"{name} ■" if key in filled_fields else name
+    
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🗿 Экскурсии", callback_data=f"field_excursions_{property_id}")],
-        [InlineKeyboardButton(text="🏛 Музеи", callback_data=f"field_museums_{property_id}")],
-        [InlineKeyboardButton(text="🌳 Парки", callback_data=f"field_parks_{property_id}")],
-        [InlineKeyboardButton(text="🎬 Кино и театры", callback_data=f"field_entertainment_{property_id}")],
+        [InlineKeyboardButton(text=field_text("🗿 Экскурсии", "excursions"), callback_data=f"field_excursions_{property_id}")],
+        [InlineKeyboardButton(text=field_text("🏛 Музеи", "museums"), callback_data=f"field_museums_{property_id}")],
+        [InlineKeyboardButton(text=field_text("🌳 Парки", "parks"), callback_data=f"field_parks_{property_id}")],
+        [InlineKeyboardButton(text=field_text("🎬 Кино и театры", "entertainment"), callback_data=f"field_entertainment_{property_id}")],
         [InlineKeyboardButton(text="➕ Добавить кнопку", callback_data=f"add_custom_exp_{property_id}")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"property_{property_id}")]
     ])
 
-def get_checkout_section_keyboard(property_id: int):
+def get_checkout_section_keyboard(property_id: int, filled_fields: set = None):
+    """Клавиатура раздела Выселение"""
+    filled_fields = filled_fields or set()
+    
+    def field_text(name: str, key: str) -> str:
+        return f"{name} ■" if key in filled_fields else name
+    
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🚪 Как выехать без менеджера?", callback_data=f"field_self_checkout_{property_id}")],
-        [InlineKeyboardButton(text="💸 Возврат депозита", callback_data=f"field_deposit_return_{property_id}")],
-        [InlineKeyboardButton(text="📅 Продлить проживание", callback_data=f"field_extend_stay_{property_id}")],
-        [InlineKeyboardButton(text="🎁 Скидки", callback_data=f"field_discounts_{property_id}")],
+        [InlineKeyboardButton(text=field_text("🚪 Как выехать без менеджера?", "self_checkout"), callback_data=f"field_self_checkout_{property_id}")],
+        [InlineKeyboardButton(text=field_text("💸 Возврат депозита", "deposit_return"), callback_data=f"field_deposit_return_{property_id}")],
+        [InlineKeyboardButton(text=field_text("📅 Продлить проживание", "extend_stay"), callback_data=f"field_extend_stay_{property_id}")],
+        [InlineKeyboardButton(text=field_text("🎁 Скидки", "discounts"), callback_data=f"field_discounts_{property_id}")],
         [InlineKeyboardButton(text="➕ Добавить кнопку", callback_data=f"add_custom_checkout_{property_id}")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"property_{property_id}")]
     ])
@@ -1126,11 +1212,14 @@ async def skip_address(callback: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data.startswith("property_") & ~F.data.startswith("prop_preview_"))
 async def view_property(callback: types.CallbackQuery):
     property_id = int(callback.data.split("_")[1])
-    property_name = await get_property_name(property_id)
+    property_info = await get_property_info(property_id)
     
-    if property_name:
+    if property_info:
+        property_name = property_info['name']
+        is_short_term = property_info['is_short_term']
+        
         text = f"Вы на странице объекта {property_name}.\n\nТут вы можете отредактировать информацию о объекте, которая будет доступна гостям."
-        await callback.message.edit_text(text, reply_markup=get_property_menu_keyboard(property_id))
+        await callback.message.edit_text(text, reply_markup=get_property_menu_keyboard(property_id, is_short_term))
     
     await callback.answer()
 
@@ -1143,54 +1232,75 @@ async def edit_property_info(callback: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("section_checkin_"))
 async def section_checkin(callback: types.CallbackQuery):
     property_id = int(callback.data.split("_")[2])
+    
+    # Получаем заполненные поля включая help и stores подразделы
+    filled_checkin = await get_filled_fields(property_id, 'checkin')
+    filled_help = await get_filled_fields(property_id, 'help')
+    filled_stores = await get_filled_fields(property_id, 'stores')
+    
+    # Объединяем все заполненные поля
+    all_filled = filled_checkin | filled_help | filled_stores
+    
+    keyboard = await get_checkin_section_keyboard_async(property_id, all_filled)
+    
     await callback.message.edit_text(
         "Вы на странице категории 🧳 Заселение",
-        reply_markup=get_checkin_section_keyboard(property_id)
+        reply_markup=keyboard
     )
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("section_rent_"))
 async def section_rent(callback: types.CallbackQuery):
     property_id = int(callback.data.split("_")[2])
+    filled_fields = await get_filled_fields(property_id, 'rent')
+    
     await callback.message.edit_text(
         "Вы на странице категории 📹 Аренда",
-        reply_markup=get_rent_section_keyboard(property_id)
+        reply_markup=get_rent_section_keyboard(property_id, filled_fields)
     )
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("subsection_help_"))
 async def subsection_help(callback: types.CallbackQuery):
     property_id = int(callback.data.split("_")[2])
+    filled_fields = await get_filled_fields(property_id, 'help')
+    
     await callback.message.edit_text(
         "Вы на странице категории 🏠 Помощь с проживанием",
-        reply_markup=get_help_subsection_keyboard(property_id)
+        reply_markup=get_help_subsection_keyboard(property_id, filled_fields)
     )
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("subsection_stores_"))
 async def subsection_stores(callback: types.CallbackQuery):
     property_id = int(callback.data.split("_")[2])
+    filled_fields = await get_filled_fields(property_id, 'stores')
+    
     await callback.message.edit_text(
         "Вы на странице категории 📍 Магазины, аптеки итд.",
-        reply_markup=get_stores_subsection_keyboard(property_id)
+        reply_markup=get_stores_subsection_keyboard(property_id, filled_fields)
     )
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("section_experiences_"))
 async def section_experiences(callback: types.CallbackQuery):
     property_id = int(callback.data.split("_")[2])
+    filled_fields = await get_filled_fields(property_id, 'experiences')
+    
     await callback.message.edit_text(
         "Вы на странице категории 🍿 Впечатления",
-        reply_markup=get_experiences_section_keyboard(property_id)
+        reply_markup=get_experiences_section_keyboard(property_id, filled_fields)
     )
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("section_checkout_"))
 async def section_checkout(callback: types.CallbackQuery):
     property_id = int(callback.data.split("_")[2])
+    filled_fields = await get_filled_fields(property_id, 'checkout')
+    
     await callback.message.edit_text(
         "Вы на странице категории 📦 Выселение",
-        reply_markup=get_checkout_section_keyboard(property_id)
+        reply_markup=get_checkout_section_keyboard(property_id, filled_fields)
     )
     await callback.answer()
 
@@ -1259,24 +1369,33 @@ async def process_field_content(message: types.Message, state: FSMContext):
     
     await save_property_field(property_id, section, field_key, field_name, text_content, file_id, file_type)
     
+    # Получаем заполненные поля для показа индикаторов
+    filled_fields = await get_filled_fields(property_id, section)
+    
     # Возвращаемся в раздел
     if section == "help":
-        keyboard = get_help_subsection_keyboard(property_id)
+        keyboard = get_help_subsection_keyboard(property_id, filled_fields)
         text = "Вы на странице категории 🏠 Помощь с проживанием"
     elif section == "stores":
-        keyboard = get_stores_subsection_keyboard(property_id)
+        keyboard = get_stores_subsection_keyboard(property_id, filled_fields)
         text = "Вы на странице категории 📍 Магазины, аптеки итд."
     elif section == "rent":
-        keyboard = get_rent_section_keyboard(property_id)
+        keyboard = get_rent_section_keyboard(property_id, filled_fields)
         text = "Вы на странице категории 📹 Аренда"
     elif section == "experiences":
-        keyboard = get_experiences_section_keyboard(property_id)
+        keyboard = get_experiences_section_keyboard(property_id, filled_fields)
         text = "Вы на странице категории 🍿 Впечатления"
     elif section == "checkout":
-        keyboard = get_checkout_section_keyboard(property_id)
+        keyboard = get_checkout_section_keyboard(property_id, filled_fields)
         text = "Вы на странице категории 📦 Выселение"
     else:
-        keyboard = get_checkin_section_keyboard(property_id)
+        # checkin - нужно получить все заполненные поля включая подразделы
+        filled_checkin = await get_filled_fields(property_id, 'checkin')
+        filled_help = await get_filled_fields(property_id, 'help')
+        filled_stores = await get_filled_fields(property_id, 'stores')
+        all_filled = filled_checkin | filled_help | filled_stores
+        
+        keyboard = get_checkin_section_keyboard(property_id, all_filled)
         text = "Вы на странице категории 🧳 Заселение"
     
     await message.answer(text, reply_markup=keyboard)
@@ -1361,8 +1480,8 @@ async def process_custom_button_content(message: types.Message, state: FSMContex
     property_id = data['custom_property_id']
     section = data['custom_section']
     field_name = data['custom_button_name']
-    field_key = f"custom_{field_name.lower().replace(' ', '_')}"
     
+    # Сохраняем контент во временное хранилище
     text_content = None
     file_id = None
     file_type = None
@@ -1382,30 +1501,143 @@ async def process_custom_button_content(message: types.Message, state: FSMContex
         file_type = "document"
         text_content = message.caption
     
+    # Сохраняем для подтверждения
+    await state.update_data(
+        custom_text_content=text_content,
+        custom_file_id=file_id,
+        custom_file_type=file_type
+    )
+    
+    # Спрашиваем подтверждение
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Назад", callback_data=f"section_{section}_{property_id}")],
+        [InlineKeyboardButton(text="Сохранить", callback_data=f"save_custom_{section}_{property_id}")],
+        [InlineKeyboardButton(text="Не сохранять", callback_data=f"section_{section}_{property_id}")]
+    ])
+    
+    await message.answer(
+        "Сохранить кнопку?",
+        reply_markup=keyboard
+    )
+    await state.set_state(PropertyStates.waiting_custom_confirm)
+
+# Состояние для подтверждения сохранения
+class PropertyStates(StatesGroup):
+    waiting_property_name = State()
+    waiting_property_address = State()
+    editing_field = State()
+    adding_custom_button_name = State()
+    adding_custom_button_content = State()
+    waiting_custom_confirm = State()  # Новое состояние
+
+# Обработчик сохранения кастомной кнопки
+@dp.callback_query(F.data.startswith("save_custom_"))
+async def save_custom_field(callback: types.CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    section = parts[2]
+    property_id = int(parts[3])
+    
+    data = await state.get_data()
+    field_name = data['custom_button_name']
+    text_content = data.get('custom_text_content')
+    file_id = data.get('custom_file_id')
+    file_type = data.get('custom_file_type')
+    
+    # Генерируем уникальный ключ для кастомной кнопки
+    import time
+    field_key = f"custom_{int(time.time())}_{field_name.lower().replace(' ', '_')[:20]}"
+    
+    # Сохраняем в БД
     await save_property_field(property_id, section, field_key, field_name, text_content, file_id, file_type)
     
+    # Показываем страницу кастомной кнопки
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Назад", callback_data=f"section_{section}_{property_id}")],
+        [InlineKeyboardButton(text="Изменить кнопку", callback_data=f"edit_custom_{property_id}_{section}_{field_key}")],
+        [InlineKeyboardButton(text="Удалить кнопку", callback_data=f"delete_custom_{property_id}_{section}_{field_key}")]
+    ])
+    
+    preview_text = text_content[:50] + "..." if text_content and len(text_content) > 50 else text_content or "(контент)"
+    
+    text = f"Вы на странице Новая кнопка\n\nсодержимое новой кнопки\n{preview_text}"
+    
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await state.clear()
+    await callback.answer("✅ Кнопка сохранена!")
+
+# Обработчик удаления кастомной кнопки
+@dp.callback_query(F.data.startswith("delete_custom_"))
+async def delete_custom_field_handler(callback: types.CallbackQuery):
+    parts = callback.data.split("_")
+    property_id = int(parts[2])
+    section = parts[3]
+    field_key = "_".join(parts[4:])
+    
+    # Удаляем из БД
+    await delete_custom_field(property_id, section, field_key)
+    
     # Возвращаемся в раздел
-    if section == "help":
-        keyboard = get_help_subsection_keyboard(property_id)
-        text = "Вы на странице категории 🏠 Помощь с проживанием"
-    elif section == "stores":
-        keyboard = get_stores_subsection_keyboard(property_id)
-        text = "Вы на странице категории 📍 Магазины, аптеки итд."
+    filled_fields = await get_filled_fields(property_id, section)
+    
+    if section == "checkin":
+        filled_checkin = await get_filled_fields(property_id, 'checkin')
+        filled_help = await get_filled_fields(property_id, 'help')
+        filled_stores = await get_filled_fields(property_id, 'stores')
+        all_filled = filled_checkin | filled_help | filled_stores
+        keyboard = await get_checkin_section_keyboard_async(property_id, all_filled)
+        text = "Вы на странице категории 🧳 Заселение"
     elif section == "rent":
-        keyboard = get_rent_section_keyboard(property_id)
+        keyboard = get_rent_section_keyboard(property_id, filled_fields)
         text = "Вы на странице категории 📹 Аренда"
-    elif section == "exp":
-        keyboard = get_experiences_section_keyboard(property_id)
+    elif section == "experiences":
+        keyboard = get_experiences_section_keyboard(property_id, filled_fields)
         text = "Вы на странице категории 🍿 Впечатления"
     elif section == "checkout":
-        keyboard = get_checkout_section_keyboard(property_id)
+        keyboard = get_checkout_section_keyboard(property_id, filled_fields)
         text = "Вы на странице категории 📦 Выселение"
-    else:
-        keyboard = get_checkin_section_keyboard(property_id)
-        text = "Вы на странице категории 🧳 Заселение"
+    elif section == "help":
+        keyboard = get_help_subsection_keyboard(property_id, filled_fields)
+        text = "Вы на странице категории 🏠 Помощь с проживанием"
+    else:  # stores
+        keyboard = get_stores_subsection_keyboard(property_id, filled_fields)
+        text = "Вы на странице категории 📍 Магазины, аптеки итд."
     
-    await message.answer(text, reply_markup=keyboard)
-    await state.clear()
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer("✅ Кнопка удалена!")
+
+# Обработчик просмотра/редактирования кастомной кнопки
+@dp.callback_query(F.data.startswith("custom_field_"))
+async def view_custom_field(callback: types.CallbackQuery):
+    parts = callback.data.split("_")
+    property_id = int(parts[2])
+    section = parts[3]
+    field_key = "_".join(parts[4:])
+    
+    # Получаем данные кнопки
+    field_data = await get_property_field(property_id, section, field_key)
+    
+    if not field_data:
+        await callback.answer("Кнопка не найдена", show_alert=True)
+        return
+    
+    # Показываем страницу кнопки
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Назад", callback_data=f"section_{section}_{property_id}")],
+        [InlineKeyboardButton(text="Изменить кнопку", callback_data=f"edit_custom_{property_id}_{section}_{field_key}")],
+        [InlineKeyboardButton(text="Удалить кнопку", callback_data=f"delete_custom_{property_id}_{section}_{field_key}")]
+    ])
+    
+    text_content = field_data['text_content']
+    preview_text = text_content[:50] + "..." if text_content and len(text_content) > 50 else text_content or "(контент)"
+    
+    # Получаем название кнопки
+    custom_fields = await get_custom_fields(property_id, section)
+    button_name = next((f['field_name'] for f in custom_fields if f['field_key'] == field_key), "Кнопка")
+    
+    text = f"Вы на странице {button_name}\n\nсодержимое новой кнопки\n{preview_text}"
+    
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
 
 # Бронирования
 @dp.callback_query(F.data.startswith("bookings_"))
@@ -1764,10 +1996,17 @@ async def toggle_shortterm_handler(callback: types.CallbackQuery):
     property_id = int(callback.data.split("_")[2])
     await toggle_short_term(property_id)
     
-    property_name = await get_property_name(property_id)
+    # Получаем обновленную информацию
+    property_info = await get_property_info(property_id)
+    property_name = property_info['name']
+    is_short_term = property_info['is_short_term']
+    
+    # Текст уведомления
+    mode_text = "краткосрочная аренда" if is_short_term else "долгосрочная аренда"
+    
     text = f"Вы на странице объекта {property_name}.\n\nТут вы можете отредактировать информацию о объекте, которая будет доступна гостям."
-    await callback.message.edit_text(text, reply_markup=get_property_menu_keyboard(property_id))
-    await callback.answer("Режим переключен")
+    await callback.message.edit_text(text, reply_markup=get_property_menu_keyboard(property_id, is_short_term))
+    await callback.answer(f"✅ Режим изменен на {mode_text}")
 
 # Ссылка для владельца объекта
 @dp.callback_query(F.data.startswith("owner_link_"))
