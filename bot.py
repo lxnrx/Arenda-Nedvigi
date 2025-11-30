@@ -467,11 +467,20 @@ def get_back_keyboard(callback="back"):
 def get_company_cabinet_keyboard(company_info):
     long_term_text = "Да" if company_info['long_term_only'] else "Нет"
     
+    # Преобразуем минуты в часовой пояс (формат UTC+X)
+    timezone_minutes = company_info.get('timezone_offset', 0)
+    timezone_hours = timezone_minutes / 60
+    
+    if timezone_hours >= 0:
+        timezone_text = f"UTC+{int(timezone_hours)}"
+    else:
+        timezone_text = f"UTC{int(timezone_hours)}"
+    
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Изменить название", callback_data="edit_company_name")],
         [InlineKeyboardButton(text="Изменить город", callback_data="edit_company_city")],
         [InlineKeyboardButton(text="Изменить приветствие", callback_data="edit_company_welcome")],
-        [InlineKeyboardButton(text="Изменить часовой пояс А мин.", callback_data="edit_company_timezone")],
+        [InlineKeyboardButton(text=f"Изменить часовой пояс: {timezone_text}", callback_data="edit_company_timezone")],
         [InlineKeyboardButton(text=f"Время заезда {company_info['checkin_time']}", callback_data="edit_checkin_time")],
         [InlineKeyboardButton(text=f"Только долгосрок: {long_term_text}", callback_data="toggle_long_term")],
         [InlineKeyboardButton(text=f"Время выезда {company_info['checkout_time']}", callback_data="edit_checkout_time")],
@@ -1068,7 +1077,7 @@ async def process_edit_company_welcome(message: types.Message, state: FSMContext
 @dp.callback_query(F.data == "edit_company_timezone")
 async def edit_company_timezone(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.edit_text(
-        "Вы редактируете кнопку\n\nЗадаем часовой пояс компании. Параметр необходим для правильной работы бота с гостями.\n\n* Указываем смещение от МСК в МИНУТАХ",
+        "Вы редактируете кнопку\n\nВведите часовой пояс вашей компании.\n\nПримеры:\n+3 для Москвы (UTC+3)\n+5 для Екатеринбурга (UTC+5)\n+7 для Новосибирска (UTC+7)\n\nВведите число:",
         reply_markup=get_back_keyboard("company_cabinet")
     )
     await state.set_state(CompanyStates.waiting_timezone)
@@ -1080,8 +1089,11 @@ async def process_edit_timezone(message: types.Message, state: FSMContext):
     company_id = data.get('current_company_id')
     
     try:
-        timezone_offset = int(message.text)
-        await update_company_field(company_id, 'timezone_offset', timezone_offset)
+        # Пользователь вводит часы (например, +3), мы храним минуты
+        timezone_hours = int(message.text.replace('+', ''))
+        timezone_minutes = timezone_hours * 60
+        
+        await update_company_field(company_id, 'timezone_offset', timezone_minutes)
         
         company_info = await get_company_info(company_id)
         text = (
@@ -1094,7 +1106,7 @@ async def process_edit_timezone(message: types.Message, state: FSMContext):
         await message.answer(text, reply_markup=get_company_cabinet_keyboard(company_info))
         await clear_state_keep_company(state)
     except ValueError:
-        await message.answer("Пожалуйста, введите число (смещение в минутах)")
+        await message.answer("Пожалуйста, введите число (например, +3 для Москвы)")
 
 @dp.callback_query(F.data == "edit_checkin_time")
 async def edit_checkin_time(callback: types.CallbackQuery, state: FSMContext):
@@ -1353,10 +1365,136 @@ async def view_property(callback: types.CallbackQuery):
     
     await callback.answer()
 
-# Редактирование объекта (заглушка)
+# Редактирование объекта - ФУНКЦИОНАЛЬНАЯ РЕАЛИЗАЦИЯ
 @dp.callback_query(F.data.startswith("edit_property_"))
-async def edit_property_info(callback: types.CallbackQuery):
-    await callback.answer("Функция редактирования основной информации в разработке. Используйте разделы ниже для редактирования содержимого.", show_alert=True)
+async def edit_property_info(callback: types.CallbackQuery, state: FSMContext):
+    property_id = int(callback.data.split("_")[2])
+    
+    # Получаем текущую информацию об объекте
+    property_info = await get_property_info(property_id)
+    
+    if not property_info:
+        await callback.answer("Объект не найден", show_alert=True)
+        return
+    
+    property_name = property_info['name']
+    property_address = property_info['address'] or "Не указан"
+    
+    # Показываем меню редактирования
+    text = f"Редактирование объекта\n\n📝 Название: {property_name}\n📍 Адрес: {property_address}\n\nВыберите, что хотите изменить:"
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Изменить название", callback_data=f"edit_prop_name_{property_id}")],
+        [InlineKeyboardButton(text="Изменить адрес", callback_data=f"edit_prop_addr_{property_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"property_{property_id}")]
+    ])
+    
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
+
+# Редактирование названия объекта - шаг 1: запрос названия
+@dp.callback_query(F.data.startswith("edit_prop_name_"))
+async def edit_property_name_start(callback: types.CallbackQuery, state: FSMContext):
+    property_id = int(callback.data.split("_")[3])
+    
+    await state.update_data(editing_property_id=property_id)
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Назад", callback_data=f"edit_property_{property_id}")],
+        [InlineKeyboardButton(text="Пропустить", callback_data=f"edit_property_{property_id}")]
+    ])
+    
+    await callback.message.edit_text(
+        "Вы редактируете кнопку\n\nВведите название объекта:",
+        reply_markup=keyboard
+    )
+    await state.set_state(PropertyStates.editing_property_name)
+    await callback.answer()
+
+# Редактирование названия объекта - шаг 2: сохранение названия
+@dp.message(PropertyStates.editing_property_name)
+async def process_edit_property_name(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    property_id = data['editing_property_id']
+    new_name = message.text
+    
+    # Сохраняем новое название
+    await state.update_data(new_property_name=new_name)
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Назад", callback_data=f"edit_property_{property_id}")],
+        [InlineKeyboardButton(text="Сохранить", callback_data=f"confirm_prop_edit_{property_id}")],
+        [InlineKeyboardButton(text="Не сохранять", callback_data=f"edit_property_{property_id}")]
+    ])
+    
+    await message.answer("Сохранить объект?", reply_markup=keyboard)
+
+# Редактирование адреса объекта - шаг 1: запрос адреса
+@dp.callback_query(F.data.startswith("edit_prop_addr_"))
+async def edit_property_address_start(callback: types.CallbackQuery, state: FSMContext):
+    property_id = int(callback.data.split("_")[3])
+    
+    await state.update_data(editing_property_id=property_id)
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Назад", callback_data=f"edit_property_{property_id}")],
+        [InlineKeyboardButton(text="Пропустить", callback_data=f"edit_property_{property_id}")]
+    ])
+    
+    await callback.message.edit_text(
+        "Введите адрес объекта:",
+        reply_markup=keyboard
+    )
+    await state.set_state(PropertyStates.editing_property_address)
+    await callback.answer()
+
+# Редактирование адреса объекта - шаг 2: сохранение адреса
+@dp.message(PropertyStates.editing_property_address)
+async def process_edit_property_address(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    property_id = data['editing_property_id']
+    new_address = message.text
+    
+    # Сохраняем новый адрес
+    await state.update_data(new_property_address=new_address)
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Назад", callback_data=f"edit_property_{property_id}")],
+        [InlineKeyboardButton(text="Сохранить", callback_data=f"confirm_prop_edit_{property_id}")],
+        [InlineKeyboardButton(text="Не сохранять", callback_data=f"edit_property_{property_id}")]
+    ])
+    
+    await message.answer("Сохранить объект?", reply_markup=keyboard)
+
+# Подтверждение сохранения изменений объекта
+@dp.callback_query(F.data.startswith("confirm_prop_edit_"))
+async def confirm_property_edit(callback: types.CallbackQuery, state: FSMContext):
+    property_id = int(callback.data.split("_")[3])
+    data = await state.get_data()
+    
+    # Обновляем название если было изменено
+    new_name = data.get('new_property_name')
+    if new_name:
+        async with db_pool.acquire() as conn:
+            await conn.execute('UPDATE properties SET name = $1 WHERE id = $2', new_name, property_id)
+    
+    # Обновляем адрес если был изменен
+    new_address = data.get('new_property_address')
+    if new_address:
+        async with db_pool.acquire() as conn:
+            await conn.execute('UPDATE properties SET address = $1 WHERE id = $2', new_address, property_id)
+    
+    # Очищаем временные данные но сохраняем company_id
+    await clear_state_keep_company(state)
+    
+    # Получаем обновленную информацию
+    property_info = await get_property_info(property_id)
+    property_name = property_info['name']
+    is_short_term = property_info['is_short_term']
+    
+    text = f"Вы на странице объекта {property_name}.\n\nТут вы можете отредактировать информацию о объекте, которая будет доступна гостям."
+    await callback.message.edit_text(text, reply_markup=get_property_menu_keyboard(property_id, is_short_term))
+    await callback.answer("✅ Изменения сохранены!")
 
 # Разделы объекта
 @dp.callback_query(F.data.startswith("section_checkin_"))
@@ -1670,7 +1808,9 @@ class PropertyStates(StatesGroup):
     editing_field = State()
     adding_custom_button_name = State()
     adding_custom_button_content = State()
-    waiting_custom_confirm = State()  # Новое состояние
+    waiting_custom_confirm = State()
+    editing_property_name = State()  # НОВОЕ: редактирование названия объекта
+    editing_property_address = State()  # НОВОЕ: редактирование адреса объекта
 
 # Обработчик сохранения кастомной кнопки
 @dp.callback_query(F.data.startswith("save_custom_"))
