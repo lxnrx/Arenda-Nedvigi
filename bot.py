@@ -133,6 +133,30 @@ async def init_db():
             )
         ''')
         
+        # Таблица админов бота
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS bot_admins (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT UNIQUE NOT NULL,
+                username TEXT,
+                first_name TEXT,
+                added_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+        
+        # Таблица предложений по улучшению бота
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS suggestions (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                username TEXT,
+                first_name TEXT,
+                suggestion_text TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW(),
+                is_read BOOLEAN DEFAULT FALSE
+            )
+        ''')
+        
         # МИГРАЦИИ для существующих баз данных
         logger.info("Running database migrations...")
         
@@ -212,6 +236,9 @@ class PropertyStates(StatesGroup):
 class BookingStates(StatesGroup):
     waiting_guest_name = State()
     waiting_checkin_date = State()
+
+class SuggestionStates(StatesGroup):
+    waiting_suggestion = State()
 
 # Вспомогательные функции БД
 async def get_user_companies(user_id: int):
@@ -450,11 +477,56 @@ async def is_first_start(user_id: int):
         result = await conn.fetchval('SELECT first_start FROM users WHERE user_id = $1', user_id)
         return result if result is not None else True
 
+# Функции для системы предложений
+async def get_bot_admins():
+    """Получить список всех админов бота"""
+    async with db_pool.acquire() as conn:
+        return await conn.fetch('SELECT user_id, username, first_name FROM bot_admins')
+
+async def is_bot_admin(user_id: int):
+    """Проверить, является ли пользователь админом бота"""
+    async with db_pool.acquire() as conn:
+        result = await conn.fetchval('SELECT 1 FROM bot_admins WHERE user_id = $1', user_id)
+        return result is not None
+
+async def save_suggestion(user_id: int, username: str, first_name: str, suggestion_text: str):
+    """Сохранить предложение в БД"""
+    async with db_pool.acquire() as conn:
+        suggestion_id = await conn.fetchval('''
+            INSERT INTO suggestions (user_id, username, first_name, suggestion_text)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id
+        ''', user_id, username, first_name, suggestion_text)
+        return suggestion_id
+
+async def get_recent_suggestions_count(user_id: int, hours: int = 1):
+    """Получить количество предложений от пользователя за последние N часов (защита от спама)"""
+    async with db_pool.acquire() as conn:
+        return await conn.fetchval('''
+            SELECT COUNT(*) FROM suggestions
+            WHERE user_id = $1 AND created_at > NOW() - INTERVAL '%s hours'
+        ''' % hours, user_id)
+
+async def add_bot_admin(user_id: int, username: str, first_name: str):
+    """Добавить админа бота"""
+    async with db_pool.acquire() as conn:
+        await conn.execute('''
+            INSERT INTO bot_admins (user_id, username, first_name)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (user_id) DO NOTHING
+        ''', user_id, username, first_name)
+
+async def remove_bot_admin(user_id: int):
+    """Удалить админа бота"""
+    async with db_pool.acquire() as conn:
+        await conn.execute('DELETE FROM bot_admins WHERE user_id = $1', user_id)
+
 # Клавиатуры
 def get_main_menu_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🏠 Добавление и настройка объектов", callback_data="objects_menu")],
-        [InlineKeyboardButton(text="🏢 Личный кабинет компании", callback_data="company_cabinet")]
+        [InlineKeyboardButton(text="🏢 Личный кабинет компании", callback_data="company_cabinet")],
+        [InlineKeyboardButton(text="💡 Что улучшить в боте", callback_data="suggest_improvement")]
     ])
 
 def get_add_company_keyboard():
@@ -2443,6 +2515,106 @@ async def switch_to_owner_mode(callback: types.CallbackQuery, state: FSMContext)
         )
     
     await callback.answer("Переключено в режим владельца")
+
+# ============================================
+# СИСТЕМА ПРЕДЛОЖЕНИЙ ПО УЛУЧШЕНИЮ БОТА
+# ============================================
+
+@dp.callback_query(F.data == "suggest_improvement")
+async def suggest_improvement_start(callback: types.CallbackQuery, state: FSMContext):
+    """Начало процесса отправки предложения"""
+    user_id = callback.from_user.id
+    
+    # Проверяем rate limiting (защита от спама)
+    recent_count = await get_recent_suggestions_count(user_id, hours=1)
+    
+    if recent_count >= 3:
+        await callback.answer(
+            "⚠️ Вы отправили слишком много предложений. Пожалуйста, подождите час.",
+            show_alert=True
+        )
+        return
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
+    ])
+    
+    text = (
+        "💡 Предложить улучшение бота\n\n"
+        "Мы ценим ваше мнение! Напишите, что бы вы хотели улучшить в боте:\n\n"
+        "• Новые функции\n"
+        "• Исправления\n"
+        "• Идеи по улучшению интерфейса\n\n"
+        "Ваше предложение будет отправлено разработчикам."
+    )
+    
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await state.set_state(SuggestionStates.waiting_suggestion)
+    await callback.answer()
+
+@dp.message(SuggestionStates.waiting_suggestion)
+async def process_suggestion(message: types.Message, state: FSMContext):
+    """Обработка полученного предложения"""
+    user_id = message.from_user.id
+    username = message.from_user.username or "Без username"
+    first_name = message.from_user.first_name or "Без имени"
+    suggestion_text = message.text
+    
+    # Проверяем длину предложения
+    if len(suggestion_text) < 10:
+        await message.answer(
+            "⚠️ Предложение слишком короткое. Пожалуйста, напишите подробнее (минимум 10 символов).",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Отмена", callback_data="main_menu")]
+            ])
+        )
+        return
+    
+    if len(suggestion_text) > 1000:
+        await message.answer(
+            "⚠️ Предложение слишком длинное. Пожалуйста, сократите текст (максимум 1000 символов).",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Отмена", callback_data="main_menu")]
+            ])
+        )
+        return
+    
+    # Сохраняем предложение в БД
+    suggestion_id = await save_suggestion(user_id, username, first_name, suggestion_text)
+    
+    # Отправляем предложение всем админам
+    admins = await get_bot_admins()
+    sent_count = 0
+    
+    for admin in admins:
+        try:
+            admin_message = (
+                f"📩 <b>Новое предложение #{suggestion_id}</b>\n\n"
+                f"👤 <b>От:</b> {first_name} (@{username})\n"
+                f"🆔 <b>User ID:</b> <code>{user_id}</code>\n"
+                f"📅 <b>Дата:</b> {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
+                f"💬 <b>Предложение:</b>\n{suggestion_text}"
+            )
+            
+            await bot.send_message(
+                admin['user_id'],
+                admin_message,
+                parse_mode="HTML"
+            )
+            sent_count += 1
+        except Exception as e:
+            logger.error(f"Failed to send suggestion to admin {admin['user_id']}: {e}")
+    
+    logger.info(f"Suggestion #{suggestion_id} from user {user_id} sent to {sent_count} admins")
+    
+    # Благодарим пользователя
+    await message.answer(
+        "✅ Спасибо за предложение!\n\n"
+        "Ваше сообщение отправлено разработчикам. Мы обязательно рассмотрим его.",
+        reply_markup=get_main_menu_keyboard()
+    )
+    
+    await state.clear()
 
 # Запуск бота
 async def on_shutdown():
