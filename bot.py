@@ -12,7 +12,7 @@ import asyncpg
 from datetime import datetime
 from typing import Optional
 import secrets
-#
+
 # Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
@@ -205,6 +205,9 @@ class PropertyStates(StatesGroup):
     editing_field = State()
     adding_custom_button_name = State()
     adding_custom_button_content = State()
+    waiting_custom_confirm = State()
+    editing_property_name = State()
+    editing_property_address = State()
 
 class BookingStates(StatesGroup):
     waiting_guest_name = State()
@@ -1802,16 +1805,6 @@ async def process_custom_button_content(message: types.Message, state: FSMContex
     await state.set_state(PropertyStates.waiting_custom_confirm)
 
 # Состояние для подтверждения сохранения
-class PropertyStates(StatesGroup):
-    waiting_property_name = State()
-    waiting_property_address = State()
-    editing_field = State()
-    adding_custom_button_name = State()
-    adding_custom_button_content = State()
-    waiting_custom_confirm = State()
-    editing_property_name = State()  # НОВОЕ: редактирование названия объекта
-    editing_property_address = State()  # НОВОЕ: редактирование адреса объекта
-
 # Обработчик сохранения кастомной кнопки
 @dp.callback_query(F.data.startswith("save_custom_"))
 async def save_custom_field(callback: types.CallbackQuery, state: FSMContext):
@@ -2467,37 +2460,34 @@ async def main():
     
     logger.info("Bot started successfully")
     
-    # HTTP сервер для health checks
-    port = os.getenv("PORT")
-    http_server = None
+    # HTTP сервер для health checks - ОБЯЗАТЕЛЕН для Railway
+    port = int(os.getenv("PORT", "8080"))
     
-    if port:
-        from aiohttp import web
-        
-        async def health_check(request):
-            return web.Response(text="Bot is running")
-        
-        async def readiness_check(request):
-            try:
-                async with db_pool.acquire() as conn:
-                    await conn.fetchval('SELECT 1')
-                return web.Response(text="Ready", status=200)
-            except Exception as e:
-                logger.error(f"Readiness check failed: {e}")
-                return web.Response(text="Not ready", status=503)
-        
-        app = web.Application()
-        app.router.add_get("/", health_check)
-        app.router.add_get("/health", health_check)
-        app.router.add_get("/ready", readiness_check)
-        
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, '0.0.0.0', int(port))
-        
-        logger.info(f"Starting health check server on port {port}")
-        await site.start()
-        http_server = runner
+    from aiohttp import web
+    
+    async def health_check(request):
+        return web.Response(text="Bot is running")
+    
+    async def readiness_check(request):
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.fetchval('SELECT 1')
+            return web.Response(text="Ready", status=200)
+        except Exception as e:
+            logger.error(f"Readiness check failed: {e}")
+            return web.Response(text="Not ready", status=503)
+    
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    app.router.add_get("/health", health_check)
+    app.router.add_get("/ready", readiness_check)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    
+    logger.info(f"Starting health check server on port {port}")
+    await site.start()
     
     # Настройка graceful shutdown
     loop = asyncio.get_event_loop()
