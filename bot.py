@@ -989,6 +989,30 @@ async def add_company(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(CompanyStates.waiting_company_name)
     await callback.answer()
 
+# Обработчик отмены создания компании
+@dp.callback_query(F.data == "cancel")
+async def cancel_company_creation(callback: types.CallbackQuery, state: FSMContext):
+    """Отмена создания компании"""
+    await state.clear()
+    
+    companies = await get_user_companies(callback.from_user.id)
+    
+    if companies:
+        # Если есть компании - возвращаем в главное меню
+        await state.update_data(current_company_id=companies[0][0])
+        text = (
+            "Вы в главном меню бота 🏠\n\n"
+            "Если вы хотите добавить апартаменты и поделиться ссылкой с гостями, "
+            "переходите в раздел «Добавление и настройка объектов»"
+        )
+        await callback.message.edit_text(text, reply_markup=get_main_menu_keyboard())
+    else:
+        # Если нет компаний - предлагаем создать
+        text = "Создание компании отменено.\n\nСоздайте компанию или присоединитесь к существующей по ссылке-приглашению."
+        await callback.message.edit_text(text, reply_markup=get_add_company_keyboard())
+    
+    await callback.answer("Отменено")
+
 @dp.message(CompanyStates.waiting_company_name)
 async def process_company_name(message: types.Message, state: FSMContext):
     await state.update_data(company_name=message.text)
@@ -1001,7 +1025,21 @@ async def process_company_name(message: types.Message, state: FSMContext):
 @dp.message(CompanyStates.waiting_company_city)
 async def process_company_city(message: types.Message, state: FSMContext):
     data = await state.get_data()
-    company_name = data['company_name']
+    
+    # ИСПРАВЛЕНИЕ: Защита от потери state между шагами
+    company_name = data.get('company_name')
+    
+    if not company_name:
+        # State был очищен или потерян - начинаем заново
+        await state.clear()
+        await message.answer(
+            "❌ Произошла ошибка. Давайте начнём сначала.\n\nНапишите название компании:",
+            reply_markup=get_back_keyboard("start")
+        )
+        await state.set_state(CompanyStates.waiting_company_name)
+        logger.warning(f"Lost company_name in state for user {message.from_user.id}")
+        return
+    
     company_city = message.text
     
     company_id = await create_company(company_name, company_city, message.from_user.id)
@@ -1371,9 +1409,22 @@ async def process_property_name(message: types.Message, state: FSMContext):
 @dp.message(PropertyStates.waiting_property_address)
 async def process_property_address(message: types.Message, state: FSMContext):
     data = await state.get_data()
-    property_name = data['property_name']
-    property_address = message.text
+    property_name = data.get('property_name')
     company_id = data.get('current_company_id')
+    
+    # ИСПРАВЛЕНИЕ: Защита от потери state
+    if not property_name:
+        await state.clear()
+        await state.update_data(current_company_id=company_id)  # Восстанавливаем company_id
+        await message.answer(
+            "❌ Произошла ошибка. Давайте начнём сначала.\n\nВведите название объекта:",
+            reply_markup=get_back_keyboard("objects_menu")
+        )
+        await state.set_state(PropertyStates.waiting_property_name)
+        logger.warning(f"Lost property_name in state for user {message.from_user.id}")
+        return
+    
+    property_address = message.text
     
     property_id = await create_property(company_id, property_name, property_address)
     
@@ -1408,8 +1459,21 @@ async def confirm_save(callback: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "skip_address")
 async def skip_address(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    property_name = data['property_name']
+    property_name = data.get('property_name')
     company_id = data.get('current_company_id')
+    
+    # ИСПРАВЛЕНИЕ: Защита от потери state
+    if not property_name:
+        await state.clear()
+        await state.update_data(current_company_id=company_id)  # Восстанавливаем company_id
+        await callback.message.edit_text(
+            "❌ Произошла ошибка. Давайте начнём сначала.\n\nВведите название объекта:",
+            reply_markup=get_back_keyboard("objects_menu")
+        )
+        await state.set_state(PropertyStates.waiting_property_name)
+        await callback.answer("⚠️ Данные потеряны, начните заново")
+        logger.warning(f"Lost property_name in state for user {callback.from_user.id}")
+        return
     
     property_id = await create_property(company_id, property_name, "")
     
@@ -2041,7 +2105,17 @@ async def process_guest_name(message: types.Message, state: FSMContext):
     await state.update_data(guest_name=message.text)
     
     data = await state.get_data()
-    property_id = data['booking_property_id']
+    property_id = data.get('booking_property_id')
+    
+    # ИСПРАВЛЕНИЕ: Защита от потери state
+    if not property_id:
+        await state.clear()
+        await message.answer(
+            "❌ Произошла ошибка. Попробуйте создать бронирование заново.",
+            reply_markup=get_main_menu_keyboard()
+        )
+        logger.warning(f"Lost booking_property_id in state for user {message.from_user.id}")
+        return
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"bookings_{property_id}")],
@@ -2057,8 +2131,18 @@ async def process_guest_name(message: types.Message, state: FSMContext):
 @dp.message(BookingStates.waiting_checkin_date)
 async def process_checkin_date(message: types.Message, state: FSMContext):
     data = await state.get_data()
-    property_id = data['booking_property_id']
-    guest_name = data['guest_name']
+    property_id = data.get('booking_property_id')
+    guest_name = data.get('guest_name')
+    
+    # ИСПРАВЛЕНИЕ: Защита от потери state
+    if not property_id or not guest_name:
+        await state.clear()
+        await message.answer(
+            "❌ Произошла ошибка. Попробуйте создать бронирование заново.",
+            reply_markup=get_main_menu_keyboard()
+        )
+        logger.warning(f"Lost booking data in state for user {message.from_user.id}")
+        return
     
     try:
         checkin_date = datetime.strptime(message.text, '%d.%m.%Y').date()
@@ -2623,6 +2707,24 @@ async def on_shutdown():
         await db_pool.close()
     await bot.session.close()
 
+async def delete_webhook_and_prepare():
+    """Удаляет webhook и подготавливает бота к polling режиму"""
+    try:
+        # Удаляем webhook если он был установлен
+        webhook_info = await bot.get_webhook_info()
+        if webhook_info.url:
+            logger.info(f"Removing existing webhook: {webhook_info.url}")
+            await bot.delete_webhook(drop_pending_updates=True)
+            logger.info("✅ Webhook removed successfully")
+        else:
+            logger.info("ℹ️  No webhook set, proceeding with polling")
+        
+        # Даём время старому боту завершиться
+        await asyncio.sleep(2)
+        
+    except Exception as e:
+        logger.warning(f"⚠️ Error while preparing bot: {e}")
+
 async def main():
     try:
         await init_db()
@@ -2661,13 +2763,16 @@ async def main():
     logger.info(f"Starting health check server on port {port}")
     await site.start()
     
+    # Удаляем webhook и готовимся к polling
+    await delete_webhook_and_prepare()
+    
     # Настройка graceful shutdown
     loop = asyncio.get_event_loop()
+    shutdown_event = asyncio.Event()
     
     def signal_handler():
-        logger.info("Received shutdown signal")
-        loop.create_task(on_shutdown())
-        loop.stop()
+        logger.info("🛑 Received shutdown signal, stopping bot gracefully...")
+        shutdown_event.set()
     
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, signal_handler)
@@ -2688,19 +2793,42 @@ async def main():
     except Exception as e:
         logger.error(f"⚠️ Failed to set bot commands: {e}")
     
-    # Запуск polling
+    # Запуск polling с graceful shutdown
+    polling_task = None
     try:
-        await dp.start_polling(
-            bot,
-            allowed_updates=dp.resolve_used_update_types(),
-            drop_pending_updates=True
+        logger.info("🚀 Starting bot polling...")
+        
+        # Создаем задачу polling
+        polling_task = asyncio.create_task(
+            dp.start_polling(
+                bot,
+                allowed_updates=dp.resolve_used_update_types(),
+                drop_pending_updates=True
+            )
         )
+        
+        # Ждём или сигнала завершения, или завершения polling
+        done, pending = await asyncio.wait(
+            [polling_task, asyncio.create_task(shutdown_event.wait())],
+            return_when=asyncio.FIRST_COMPLETED
+        )
+        
+        # Если получили shutdown signal - останавливаем polling
+        if not polling_task.done():
+            logger.info("⏹️ Stopping polling gracefully...")
+            polling_task.cancel()
+            try:
+                await polling_task
+            except asyncio.CancelledError:
+                logger.info("✅ Polling stopped successfully")
+        
     except Exception as e:
-        logger.error(f"Polling error: {e}")
+        logger.error(f"❌ Polling error: {e}")
     finally:
+        logger.info("🧹 Cleaning up resources...")
         await on_shutdown()
-        if http_server:
-            await http_server.cleanup()
+        await runner.cleanup()
+        logger.info("👋 Bot stopped successfully")
 
 if __name__ == '__main__':
     try:
