@@ -12,7 +12,7 @@ import asyncpg
 from datetime import datetime
 from typing import Optional
 import secrets
-
+#
 # Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
