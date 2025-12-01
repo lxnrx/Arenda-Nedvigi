@@ -29,6 +29,44 @@ bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
+# Middleware для автоматической регистрации пользователей
+@dp.update.outer_middleware()
+async def auto_register_user_middleware(handler, event: types.Update, data: dict):
+    """
+    Автоматически регистрирует пользователя в БД при любом взаимодействии с ботом.
+    Это гарантирует что foreign key constraints не будут нарушены.
+    
+    КРИТИЧЕСКИ ВАЖНО: Пользователь ДОЛЖЕН существовать в таблице users перед тем,
+    как создавать записи в user_companies, user_properties и других связанных таблицах.
+    """
+    user = None
+    
+    # Извлекаем пользователя из разных типов обновлений
+    if event.message:
+        user = event.message.from_user
+    elif event.callback_query:
+        user = event.callback_query.from_user
+    elif event.inline_query:
+        user = event.inline_query.from_user
+    
+    # Если нашли пользователя - регистрируем его
+    if user and db_pool:
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.execute('''
+                    INSERT INTO users (user_id, username, first_name)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (user_id) DO UPDATE
+                    SET username = EXCLUDED.username,
+                        first_name = EXCLUDED.first_name,
+                        last_interaction = CURRENT_TIMESTAMP
+                ''', user.id, user.username, user.first_name)
+        except Exception as e:
+            logger.error(f"⚠️ Error auto-registering user {user.id}: {e}")
+    
+    # Продолжаем обработку события
+    return await handler(event, data)
+
 # Глобальный пул соединений
 db_pool: Optional[asyncpg.Pool] = None
 
@@ -209,6 +247,23 @@ async def init_db():
                 logger.info(f"✅ Migration: Generated invite codes ({result})")
         except Exception as e:
             logger.error(f"❌ generate invite_code migration failed: {e}")
+        
+        # Миграция 4: Добавляем last_interaction в users (для мониторинга активности)
+        try:
+            column_exists = await conn.fetchval('''
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.columns 
+                    WHERE table_name = 'users' AND column_name = 'last_interaction'
+                )
+            ''')
+            
+            if not column_exists:
+                await conn.execute('ALTER TABLE users ADD COLUMN last_interaction TIMESTAMP DEFAULT NOW()')
+                logger.info("✅ Migration: Added last_interaction column to users")
+            else:
+                logger.info("ℹ️  last_interaction column already exists")
+        except Exception as e:
+            logger.error(f"❌ last_interaction migration failed: {e}")
         
         logger.info("Database initialized successfully")
 
@@ -1714,6 +1769,9 @@ async def section_checkout(callback: types.CallbackQuery):
 # Редактирование полей
 @dp.callback_query(F.data.startswith("field_"))
 async def edit_field(callback: types.CallbackQuery, state: FSMContext):
+    # КРИТИЧЕСКИ ВАЖНО: answer() в НАЧАЛЕ предотвращает двойные нажатия!
+    await callback.answer()
+    
     parts = callback.data.split("_")
     field_key = "_".join(parts[1:-1])
     property_id = int(parts[-1])
@@ -1745,15 +1803,24 @@ async def edit_field(callback: types.CallbackQuery, state: FSMContext):
     
     await callback.message.edit_text(text, reply_markup=get_field_edit_keyboard(property_id, section))
     await state.set_state(PropertyStates.editing_field)
-    await callback.answer()
 
 @dp.message(PropertyStates.editing_field)
 async def process_field_content(message: types.Message, state: FSMContext):
     data = await state.get_data()
-    property_id = data['editing_property_id']
-    field_key = data['editing_field_key']
-    field_name = data['editing_field_name']
-    section = data['editing_section']
+    property_id = data.get('editing_property_id')
+    field_key = data.get('editing_field_key')
+    field_name = data.get('editing_field_name')
+    section = data.get('editing_section')
+    
+    # ИСПРАВЛЕНИЕ: Защита от потери state
+    if not property_id or not field_key or not section:
+        await state.clear()
+        await message.answer(
+            "❌ Произошла ошибка. Попробуйте отредактировать поле заново.",
+            reply_markup=get_main_menu_keyboard()
+        )
+        logger.warning(f"Lost editing data in state for user {message.from_user.id}")
+        return
     
     text_content = None
     file_id = None
