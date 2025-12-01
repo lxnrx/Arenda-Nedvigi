@@ -2366,10 +2366,6 @@ async def preview_section(callback: types.CallbackQuery):
     
     fields = await get_section_fields(property_id, section)
     
-    if not fields:
-        await callback.answer("В этом разделе пока нет информации", show_alert=True)
-        return
-    
     section_name = SECTION_NAMES.get(section, section)
     section_icon = SECTION_ICONS.get(section, "📄")
     
@@ -2380,11 +2376,81 @@ async def preview_section(callback: types.CallbackQuery):
         text = f"Вы на странице категории {section_icon} {section_name}"
     
     buttons = []
+    
+    # Добавляем поля основного раздела
     for field in fields:
         field_name = field['field_name']
         buttons.append([InlineKeyboardButton(text=field_name, callback_data=f"prevw_field_{property_id}_{section}_{field['field_key']}")])
     
+    # ИСПРАВЛЕНИЕ: Для раздела "Заселение" добавляем подразделы если там есть данные
+    if section == 'checkin':
+        # Проверяем есть ли данные в подразделе "Помощь с проживанием"
+        help_fields = await get_section_fields(property_id, 'help')
+        if help_fields:
+            buttons.append([InlineKeyboardButton(text="🏠 Помощь с проживанием", callback_data=f"prevw_subsection_help_{property_id}")])
+        
+        # Проверяем есть ли данные в подразделе "Магазины, аптеки"
+        stores_fields = await get_section_fields(property_id, 'stores')
+        if stores_fields:
+            buttons.append([InlineKeyboardButton(text="📍 Магазины, аптеки итд.", callback_data=f"prevw_subsection_stores_{property_id}")])
+    
+    # Если нет ни полей, ни подразделов - показываем предупреждение
+    if not buttons:
+        await callback.answer("В этом разделе пока нет информации", show_alert=True)
+        return
+    
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"prevw_start_{property_id}")])
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
+
+# Просмотр подразделов в preview режиме
+@dp.callback_query(F.data.startswith("prevw_subsection_help_"))
+async def preview_subsection_help(callback: types.CallbackQuery):
+    """Просмотр подраздела 'Помощь с проживанием' в preview режиме"""
+    property_id = int(callback.data.split("_")[3])
+    
+    fields = await get_section_fields(property_id, 'help')
+    
+    if not fields:
+        await callback.answer("В этом подразделе пока нет информации", show_alert=True)
+        return
+    
+    text = "Вы на странице категории 🏠 Помощь с проживанием"
+    
+    buttons = []
+    for field in fields:
+        field_name = field['field_name']
+        buttons.append([InlineKeyboardButton(text=field_name, callback_data=f"prevw_field_{property_id}_help_{field['field_key']}")])
+    
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"prevw_section_checkin_{property_id}")])
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("prevw_subsection_stores_"))
+async def preview_subsection_stores(callback: types.CallbackQuery):
+    """Просмотр подраздела 'Магазины, аптеки' в preview режиме"""
+    property_id = int(callback.data.split("_")[3])
+    
+    fields = await get_section_fields(property_id, 'stores')
+    
+    if not fields:
+        await callback.answer("В этом подразделе пока нет информации", show_alert=True)
+        return
+    
+    text = "Вы на странице категории 📍 Магазины, аптеки итд."
+    
+    buttons = []
+    for field in fields:
+        field_name = field['field_name']
+        buttons.append([InlineKeyboardButton(text=field_name, callback_data=f"prevw_field_{property_id}_stores_{field['field_key']}")])
+    
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"prevw_section_checkin_{property_id}")])
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     
@@ -2563,10 +2629,6 @@ async def guest_view_section(callback: types.CallbackQuery):
     
     fields = await get_section_fields(property_id, section)
     
-    if not fields:
-        await callback.answer("В этом разделе пока нет информации", show_alert=True)
-        return
-    
     section_name = SECTION_NAMES.get(section, section)
     section_icon = SECTION_ICONS.get(section, "📄")
     
@@ -2577,11 +2639,81 @@ async def guest_view_section(callback: types.CallbackQuery):
         text = f"Вы на странице категории {section_icon} {section_name}"
     
     buttons = []
+    
+    # Добавляем поля основного раздела
     for field in fields:
         field_name = field['field_name']
         buttons.append([InlineKeyboardButton(text=field_name, callback_data=f"guest_field_{property_id}_{section}_{field['field_key']}")])
     
+    # ИСПРАВЛЕНИЕ: Для раздела "Заселение" добавляем подразделы если там есть данные
+    if section == 'checkin':
+        # Проверяем есть ли данные в подразделе "Помощь с проживанием"
+        help_fields = await get_section_fields(property_id, 'help')
+        if help_fields:
+            buttons.append([InlineKeyboardButton(text="🏠 Помощь с проживанием", callback_data=f"guest_subsection_help_{property_id}")])
+        
+        # Проверяем есть ли данные в подразделе "Магазины, аптеки"
+        stores_fields = await get_section_fields(property_id, 'stores')
+        if stores_fields:
+            buttons.append([InlineKeyboardButton(text="📍 Магазины, аптеки итд.", callback_data=f"guest_subsection_stores_{property_id}")])
+    
+    # Если нет ни полей, ни подразделов - показываем предупреждение
+    if not buttons:
+        await callback.answer("В этом разделе пока нет информации", show_alert=True)
+        return
+    
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"guest_start_{property_id}")])
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
+
+# Просмотр подразделов в guest режиме
+@dp.callback_query(F.data.startswith("guest_subsection_help_"))
+async def guest_subsection_help(callback: types.CallbackQuery):
+    """Просмотр подраздела 'Помощь с проживанием' в guest режиме"""
+    property_id = int(callback.data.split("_")[3])
+    
+    fields = await get_section_fields(property_id, 'help')
+    
+    if not fields:
+        await callback.answer("В этом подразделе пока нет информации", show_alert=True)
+        return
+    
+    text = "Вы на странице категории 🏠 Помощь с проживанием"
+    
+    buttons = []
+    for field in fields:
+        field_name = field['field_name']
+        buttons.append([InlineKeyboardButton(text=field_name, callback_data=f"guest_field_{property_id}_help_{field['field_key']}")])
+    
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"guest_section_checkin_{property_id}")])
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("guest_subsection_stores_"))
+async def guest_subsection_stores(callback: types.CallbackQuery):
+    """Просмотр подраздела 'Магазины, аптеки' в guest режиме"""
+    property_id = int(callback.data.split("_")[3])
+    
+    fields = await get_section_fields(property_id, 'stores')
+    
+    if not fields:
+        await callback.answer("В этом подразделе пока нет информации", show_alert=True)
+        return
+    
+    text = "Вы на странице категории 📍 Магазины, аптеки итд."
+    
+    buttons = []
+    for field in fields:
+        field_name = field['field_name']
+        buttons.append([InlineKeyboardButton(text=field_name, callback_data=f"guest_field_{property_id}_stores_{field['field_key']}")])
+    
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"guest_section_checkin_{property_id}")])
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     
