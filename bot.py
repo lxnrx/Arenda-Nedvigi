@@ -70,6 +70,42 @@ async def auto_register_user_middleware(handler, event: types.Update, data: dict
 # Глобальный пул соединений
 db_pool: Optional[asyncpg.Pool] = None
 
+# ИСПРАВЛЕНИЕ: Глобальный error handler для необработанных updates
+@dp.error()
+async def global_error_handler(event: types.ErrorEvent):
+    """
+    Глобальный обработчик ошибок для всех необработанных updates.
+    
+    Это предотвращает "Update is not handled" ошибки и логирует проблемы.
+    """
+    logger.error(
+        f"❌ Critical error during update {event.update.update_id} processing:\n"
+        f"Exception: {event.exception}\n"
+        f"Update: {event.update}"
+    )
+    
+    # Если это callback query - отвечаем чтобы убрать loading spinner
+    if event.update.callback_query:
+        try:
+            await event.update.callback_query.answer(
+                "⚠️ Произошла ошибка. Попробуйте ещё раз или обратитесь в поддержку.",
+                show_alert=True
+            )
+        except Exception as e:
+            logger.error(f"Failed to answer callback query: {e}")
+    
+    # Если это message - отправляем сообщение об ошибке
+    elif event.update.message:
+        try:
+            await event.update.message.answer(
+                "⚠️ Произошла ошибка. Попробуйте ещё раз или используйте /start",
+                reply_markup=get_main_menu_keyboard()
+            )
+        except Exception as e:
+            logger.error(f"Failed to send error message: {e}")
+    
+    return True  # Помечаем update как обработанный
+
 # Helper функция для безопасной очистки state
 async def clear_state_keep_company(state: FSMContext):
     """Очищает state, но сохраняет current_company_id"""
@@ -2899,6 +2935,55 @@ async def process_suggestion(message: types.Message, state: FSMContext):
     
     await state.clear()
 
+# ИСПРАВЛЕНИЕ: Fallback handler для всех необработанных callbacks
+# Это предотвращает "Update is not handled" ошибки
+@dp.callback_query()
+async def fallback_callback_handler(callback: types.CallbackQuery):
+    """
+    Обработчик для всех необработанных callback queries.
+    
+    Это последний обработчик в цепочке - если ни один другой обработчик
+    не сработал, этот обработчик ответит пользователю.
+    """
+    logger.warning(
+        f"⚠️ Unhandled callback from user {callback.from_user.id}: "
+        f"data='{callback.data}' message_id={callback.message.message_id}"
+    )
+    
+    await callback.answer(
+        "⚠️ Эта кнопка устарела. Используйте /start для возврата в главное меню.",
+        show_alert=True
+    )
+    
+    # Пытаемся вернуть пользователя в главное меню
+    try:
+        text = (
+            "Вы в главном меню бота 🏠\n\n"
+            "Если вы хотите добавить апартаменты и поделиться ссылкой с гостями, "
+            "переходите в раздел «Добавление и настройка объектов»"
+        )
+        await callback.message.edit_text(text, reply_markup=get_main_menu_keyboard())
+    except Exception as e:
+        logger.error(f"Failed to edit message in fallback handler: {e}")
+
+# ИСПРАВЛЕНИЕ: Fallback handler для всех необработанных сообщений
+@dp.message()
+async def fallback_message_handler(message: types.Message):
+    """
+    Обработчик для всех необработанных сообщений.
+    
+    Это последний обработчик в цепочке для сообщений.
+    """
+    logger.warning(
+        f"⚠️ Unhandled message from user {message.from_user.id}: "
+        f"text='{message.text}' content_type={message.content_type}"
+    )
+    
+    await message.answer(
+        "⚠️ Не понимаю эту команду. Используйте /start для возврата в главное меню.",
+        reply_markup=get_main_menu_keyboard()
+    )
+
 # Запуск бота
 async def on_shutdown():
     logger.info("Shutting down...")
@@ -2918,8 +3003,19 @@ async def delete_webhook_and_prepare():
         else:
             logger.info("ℹ️  No webhook set, proceeding with polling")
         
-        # Даём время старому боту завершиться
-        await asyncio.sleep(2)
+        # ИСПРАВЛЕНИЕ: Увеличиваем время ожидания для завершения старого инстанса
+        # Это критически важно для предотвращения flood control
+        logger.info("⏳ Waiting 10 seconds for old instance to fully shutdown...")
+        await asyncio.sleep(10)
+        
+        # Проверяем что webhook действительно удален
+        webhook_check = await bot.get_webhook_info()
+        if webhook_check.url:
+            logger.error(f"❌ Webhook still exists: {webhook_check.url}")
+            await bot.delete_webhook(drop_pending_updates=True)
+            await asyncio.sleep(5)
+        
+        logger.info("✅ Bot is ready for polling")
         
     except Exception as e:
         logger.warning(f"⚠️ Error while preparing bot: {e}")
@@ -2997,12 +3093,16 @@ async def main():
     try:
         logger.info("🚀 Starting bot polling...")
         
-        # Создаем задачу polling
+        # ИСПРАВЛЕНИЕ: Увеличиваем timeout для предотвращения flood control
+        # Telegram рекомендует timeout от 20 до 120 секунд
+        # Это уменьшает частоту GetUpdates запросов
         polling_task = asyncio.create_task(
             dp.start_polling(
                 bot,
                 allowed_updates=dp.resolve_used_update_types(),
-                drop_pending_updates=True
+                drop_pending_updates=True,
+                timeout=60,  # Увеличен с дефолтного 20 до 60 секунд
+                request_timeout=60  # Timeout для HTTP запросов
             )
         )
         
