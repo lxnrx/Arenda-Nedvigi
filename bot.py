@@ -928,17 +928,17 @@ SECTION_NAMES = {
 
 # URL-ссылки для полезных функций (заполнить нужными ссылками)
 USEFUL_LINKS = {
-    'new_apartment': 'https://example.com/apartments',  # Найти новую квартиру
-    'accountant': 'https://example.com/accountant',     # Задать вопрос бухгалтеру
-    'group_purchase': 'https://example.com/purchase',   # Сделать общую закупку
-    'guest_exchange': 'https://example.com/exchange',   # Обменяться гостями
-    'lawyer': 'https://example.com/lawyer',             # Задать вопрос юристу
-    'location': 'https://example.com/location',         # Найти выгодную локацию
-    'furnish': 'https://example.com/furnish',           # Обустроить квартиру
-    'invest': 'https://example.com/invest',             # Инвестировать
-    'books': 'https://example.com/books',               # Полезные книги
-    'psychology': 'https://example.com/psychology',     # Психология
-    'join_chat': 'https://example.com/join'             # Стать участником
+    'new_apartment': '',  # Найти новую квартиру
+    'accountant': '',     # Задать вопрос бухгалтеру
+    'group_purchase': '',   # Сделать общую закупку
+    'guest_exchange': '',   # Обменяться гостями
+    'lawyer': '',             # Задать вопрос юристу
+    'location': '',         # Найти выгодную локацию
+    'furnish': '',           # Обустроить квартиру
+    'invest': '',             # Инвестировать
+    'books': '',               # Полезные книги
+    'psychology': '',     # Психология
+    'join_chat': ''             # Стать участником
 }
 
 # ============================================
@@ -1097,7 +1097,7 @@ async def back_to_home_handler(callback: types.CallbackQuery):
     Обработчик кнопки "Назад" из меню полезных функций.
     Возвращает пользователя в главное /home меню.
     """
-    text = "Вы в #ботподелу 🤖"
+    text = "Вы в боте 🤖"
     
     await callback.message.edit_text(text, reply_markup=get_home_keyboard())
     await callback.answer()
