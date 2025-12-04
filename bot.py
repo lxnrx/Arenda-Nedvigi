@@ -630,6 +630,41 @@ def get_back_keyboard(callback="back"):
         [InlineKeyboardButton(text="⬅️ Назад", callback_data=callback)]
     ])
 
+def get_home_keyboard():
+    """
+    Главная клавиатура команды /home с двумя разделами:
+    1. Главное меню (основной функционал бота)
+    2. Полезные функции (внешние ссылки)
+    """
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Главное меню", callback_data="home_main_menu")],
+        [InlineKeyboardButton(text="Полезные функции 🔥", callback_data="home_useful_sections")]
+    ])
+
+def get_useful_sections_keyboard():
+    """
+    Клавиатура с полезными разделами (URL-кнопки ведут на внешние ресурсы).
+    
+    ВАЖНО: Замените URL в константе USEFUL_LINKS на реальные ссылки!
+    """
+    return InlineKeyboardMarkup(inline_keyboard=[
+        # Полезные разделы
+        [InlineKeyboardButton(text="Найти новую квартиру 🏠", url=USEFUL_LINKS['new_apartment'])],
+        [InlineKeyboardButton(text="Задать вопрос бухгалтеру 💵", url=USEFUL_LINKS['accountant'])],
+        [InlineKeyboardButton(text="Сделать общую закупку 📦", url=USEFUL_LINKS['group_purchase'])],
+        [InlineKeyboardButton(text="Обменяться гостями 👥", url=USEFUL_LINKS['guest_exchange'])],
+        [InlineKeyboardButton(text="Задать вопрос юристу 📄", url=USEFUL_LINKS['lawyer'])],
+        [InlineKeyboardButton(text="Найти выгодную локацию 📍", url=USEFUL_LINKS['location'])],
+        [InlineKeyboardButton(text="Обустроить квартиру 🪑", url=USEFUL_LINKS['furnish'])],
+        [InlineKeyboardButton(text="Инвестировать 📊", url=USEFUL_LINKS['invest'])],
+        [InlineKeyboardButton(text="Полезные книги 📚", url=USEFUL_LINKS['books'])],
+        [InlineKeyboardButton(text="Психология 🧠", url=USEFUL_LINKS['psychology'])],
+        [InlineKeyboardButton(text="Стать участником 🔥", url=USEFUL_LINKS['join_chat'])],
+        
+        # Кнопка "Назад" возвращает в /home меню
+        [InlineKeyboardButton(text="Назад", callback_data="back_to_home")]
+    ])
+
 def get_company_cabinet_keyboard(company_info):
     long_term_text = "Да" if company_info['long_term_only'] else "Нет"
     
@@ -888,6 +923,25 @@ SECTION_NAMES = {
 }
 
 # ============================================
+# КОНСТАНТЫ ДЛЯ ПОЛЕЗНЫХ РАЗДЕЛОВ
+# ============================================
+
+# URL-ссылки для полезных функций (заполнить нужными ссылками)
+USEFUL_LINKS = {
+    'new_apartment': 'https://example.com/apartments',  # Найти новую квартиру
+    'accountant': 'https://example.com/accountant',     # Задать вопрос бухгалтеру
+    'group_purchase': 'https://example.com/purchase',   # Сделать общую закупку
+    'guest_exchange': 'https://example.com/exchange',   # Обменяться гостями
+    'lawyer': 'https://example.com/lawyer',             # Задать вопрос юристу
+    'location': 'https://example.com/location',         # Найти выгодную локацию
+    'furnish': 'https://example.com/furnish',           # Обустроить квартиру
+    'invest': 'https://example.com/invest',             # Инвестировать
+    'books': 'https://example.com/books',               # Полезные книги
+    'psychology': 'https://example.com/psychology',     # Психология
+    'join_chat': 'https://example.com/join'             # Стать участником
+}
+
+# ============================================
 # КОМАНДЫ ДЛЯ БЫСТРОГО ДОСТУПА
 # ============================================
 
@@ -975,6 +1029,78 @@ async def cmd_apartments(message: types.Message, state: FSMContext):
         f"Вот список ваших объектов. Здесь вы можете добавлять и редактировать их.\n\n{count_text}",
         reply_markup=get_objects_list_keyboard(properties)
     )
+
+@dp.message(Command("home"))
+async def cmd_home(message: types.Message):
+    """
+    Команда /home - главная страница с двумя разделами:
+    1. Главное меню - основной функционал бота для управления объектами
+    2. Полезные функции - внешние ссылки на полезные ресурсы
+    
+    Эта команда служит "домашней страницей" бота.
+    """
+    text = "Вы в #ботподелу 🤖"
+    
+    await message.answer(
+        text,
+        reply_markup=get_home_keyboard()
+    )
+
+# ============================================
+# ОБРАБОТЧИКИ ГЛАВНОЙ СТРАНИЦЫ /HOME
+# ============================================
+
+@dp.callback_query(F.data == "home_main_menu")
+async def home_main_menu_handler(callback: types.CallbackQuery, state: FSMContext):
+    """
+    Обработчик кнопки "Главное меню" из /home.
+    Переводит пользователя в основное меню бота.
+    """
+    # Автоматически устанавливаем company_id если его нет
+    data = await state.get_data()
+    company_id = data.get('current_company_id')
+    
+    if not company_id:
+        companies = await get_user_companies(callback.from_user.id)
+        if companies:
+            company_id = companies[0][0]
+            await state.update_data(current_company_id=company_id)
+    
+    text = (
+        "Вы в главном меню бота 🏠\n\n"
+        "Если вы хотите добавить апартаменты и поделиться ссылкой с гостями, "
+        "переходите в раздел «Добавление и настройка объектов»"
+    )
+    
+    await callback.message.edit_text(text, reply_markup=get_main_menu_keyboard())
+    await callback.answer()
+
+@dp.callback_query(F.data == "home_useful_sections")
+async def home_useful_sections_handler(callback: types.CallbackQuery):
+    """
+    Обработчик кнопки "Полезные функции" из /home.
+    Показывает меню с внешними ссылками на полезные ресурсы.
+    
+    ВАЖНО: URL-ссылки настраиваются в константе USEFUL_LINKS.
+    """
+    text = (
+        "Полезные разделы. Для получения доступа к разделам обратитесь "
+        "к вашему персональному менеджеру: Анна @mir_any"
+    )
+    
+    await callback.message.edit_text(text, reply_markup=get_useful_sections_keyboard())
+    await callback.answer()
+
+@dp.callback_query(F.data == "back_to_home")
+async def back_to_home_handler(callback: types.CallbackQuery):
+    """
+    Обработчик кнопки "Назад" из меню полезных функций.
+    Возвращает пользователя в главное /home меню.
+    """
+    text = "Вы в #ботподелу 🤖"
+    
+    await callback.message.edit_text(text, reply_markup=get_home_keyboard())
+    await callback.answer()
 
 # ============================================
 # КОМАНДА /START
@@ -3077,6 +3203,7 @@ async def main():
     
     commands = [
         BotCommand(command="start", description="🚀 Запустить бота"),
+        BotCommand(command="home", description="🏡 Главная страница"),
         BotCommand(command="menu", description="🏠 Главное меню"),
         BotCommand(command="company", description="🏢 Личный кабинет компании"),
         BotCommand(command="apartments", description="🏘️ Список объектов")
