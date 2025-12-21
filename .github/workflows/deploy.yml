@@ -1,0 +1,48 @@
+name: Deploy to Yandex Cloud
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Deploy to server
+      uses: appleboy/ssh-action@master
+      with:
+        host: ${{ secrets.VPS_HOST }}
+        username: ${{ secrets.VPS_USER }}
+        key: ${{ secrets.VPS_SSH_KEY }}
+        script: |
+          # Переходим в директорию проекта
+          cd ~/telegram-bot || mkdir -p ~/telegram-bot && cd ~/telegram-bot
+          
+          # Клонируем/обновляем репозиторий
+          if [ -d .git ]; then
+            git pull origin main
+          else
+            git clone https://github.com/ВАШ_USERNAME/arenda-nedvigi-bot.git .
+          fi
+          
+          # Останавливаем старые контейнеры
+          docker compose down || true
+          
+          # Создаем .env файл
+          cat > .env << EOF
+          BOT_TOKEN=${{ secrets.BOT_TOKEN }}
+          DATABASE_URL=${{ secrets.DATABASE_URL }}
+          PORT=8080
+          EOF
+          
+          # Запускаем через docker compose
+          docker compose up -d --build
+          
+          # Показываем статус
+          docker compose ps
+          docker compose logs --tail=50
