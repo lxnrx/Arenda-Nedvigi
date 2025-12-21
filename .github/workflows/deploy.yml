@@ -27,7 +27,7 @@ jobs:
           if [ -d .git ]; then
             git pull origin main
           else
-            git clone https://github.com/lxnrx/arenda-nedvigi-bot.git .
+            git clone https://github.com/lxnrx/Arenda-Nedvigi.git .
           fi
           
           # Останавливаем старые контейнеры
