@@ -12,12 +12,15 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем код бота
-COPY bot.py .
+# Копируем код бота (используем bot_strapi.py)
+COPY bot_strapi.py .
 
 # Создаем непривилегированного пользователя
 RUN useradd -m -u 1000 botuser && chown -R botuser:botuser /app
 USER botuser
 
-# Открываем порт для health check (если Railway требует)
+# Открываем порт для health check
 EXPOSE 8080
+
+# Запускаем bot_strapi.py
+CMD ["python", "bot_strapi.py"]
