@@ -697,7 +697,7 @@ async def get_section_fields(apt_id: int, section: str) -> List[Dict]:
     section_name = SECTION_TO_CATEGORY_MAP.get(section, section)
     
     async with db_pool.acquire() as conn:
-        # ИСПРАВЛЕННЫЙ ЗАПРОС: ищем через родительские категории
+        # ИСПРАВЛЕН: добавлен created_at в SELECT для ORDER BY
         rows = await conn.fetch('''
             SELECT DISTINCT
                 i.id,
@@ -705,7 +705,8 @@ async def get_section_fields(apt_id: int, section: str) -> List[Dict]:
                 i.text,
                 i.type,
                 i.caption,
-                child_cat.name as category_name
+                child_cat.name as category_name,
+                i.created_at
             FROM infos i
             JOIN infos_apartment_lnk ial ON i.id = ial.info_id
             JOIN infos_category_lnk icl ON i.id = icl.info_id
