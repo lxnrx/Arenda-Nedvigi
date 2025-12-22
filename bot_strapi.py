@@ -643,51 +643,87 @@ async def save_apartment_field(
             ''', info_id, field_cat_id)
 
 async def get_apartment_field(apt_id: int, section: str, field_key: str) -> Optional[Dict]:
-    """Получить информацию о поле квартиры"""
-    field_category_name = FIELD_TO_CATEGORY_MAP.get(field_key, field_key)
+    """Получить информацию о конкретном поле квартиры"""
+    
+    # Пробуем найти по названию категории из маппинга
+    field_category_name = FIELD_TO_CATEGORY_MAP.get(field_key)
     
     async with db_pool.acquire() as conn:
+        # Сначала пробуем точное совпадение по категории
+        if field_category_name:
+            row = await conn.fetchrow('''
+                SELECT i.name, i.text, i.type, i.caption
+                FROM infos i
+                JOIN infos_apartment_lnk ial ON i.id = ial.info_id
+                JOIN infos_category_lnk icl ON i.id = icl.info_id
+                JOIN categories c ON icl.category_id = c.id
+                WHERE ial.apartment_id = $1 AND c.name = $2
+                LIMIT 1
+            ''', apt_id, field_category_name)
+            
+            if row:
+                return {
+                    'text_content': row['text'],
+                    'file_id': row['caption'],
+                    'file_type': row['type']
+                }
+        
+        # Если не нашли - пробуем через поиск по названию
+        # Преобразуем field_key обратно в название
+        search_name = field_key.replace('_', ' ').title()
+        
         row = await conn.fetchrow('''
             SELECT i.name, i.text, i.type, i.caption
             FROM infos i
             JOIN infos_apartment_lnk ial ON i.id = ial.info_id
             JOIN infos_category_lnk icl ON i.id = icl.info_id
             JOIN categories c ON icl.category_id = c.id
-            WHERE ial.apartment_id = $1 AND c.name = $2
+            WHERE ial.apartment_id = $1 
+            AND (c.name ILIKE $2 OR i.name ILIKE $2)
             LIMIT 1
-        ''', apt_id, field_category_name)
+        ''', apt_id, f'%{search_name}%')
         
         if not row:
             return None
         
         return {
             'text_content': row['text'],
-            'file_id': row['caption'],  # Используем caption для file_id
+            'file_id': row['caption'],
             'file_type': row['type']
         }
 
 async def get_section_fields(apt_id: int, section: str) -> List[Dict]:
-    """Получить все поля раздела"""
+    """Получить все поля раздела с учетом иерархии категорий"""
     section_name = SECTION_TO_CATEGORY_MAP.get(section, section)
     
     async with db_pool.acquire() as conn:
+        # ИСПРАВЛЕННЫЙ ЗАПРОС: ищем через родительские категории
         rows = await conn.fetch('''
-            SELECT i.name as field_name, i.text, i.type, i.caption,
-                   c.name as category_name
+            SELECT DISTINCT
+                i.id,
+                i.name as field_name,
+                i.text,
+                i.type,
+                i.caption,
+                child_cat.name as category_name
             FROM infos i
             JOIN infos_apartment_lnk ial ON i.id = ial.info_id
             JOIN infos_category_lnk icl ON i.id = icl.info_id
-            JOIN categories c ON icl.category_id = c.id
-            JOIN categories_parent_lnk cpl ON c.id = cpl.category_id
-            JOIN categories parent ON cpl.inv_category_id = parent.id
-            WHERE ial.apartment_id = $1 AND parent.name = $2
+            JOIN categories child_cat ON icl.category_id = child_cat.id
+            LEFT JOIN categories_parent_lnk cpl ON child_cat.id = cpl.category_id
+            LEFT JOIN categories parent_cat ON cpl.inv_category_id = parent_cat.id
+            WHERE ial.apartment_id = $1
+            AND (parent_cat.name = $2 OR child_cat.name = $2)
             ORDER BY i.created_at
         ''', apt_id, section_name)
         
         result = []
         for row in rows:
+            # Генерируем field_key из категории
+            field_key = row['category_name'].lower().replace(' ', '_').replace('ё', 'е')
+            
             result.append({
-                'field_key': row['category_name'].lower().replace(' ', '_'),
+                'field_key': field_key,
                 'field_name': row['field_name'],
                 'text_content': row['text'],
                 'file_id': row['caption'],
@@ -699,7 +735,14 @@ async def get_section_fields(apt_id: int, section: str) -> List[Dict]:
 async def get_filled_fields(apt_id: int, section: str) -> set:
     """Получить список заполненных полей раздела"""
     fields = await get_section_fields(apt_id, section)
-    return set(f['field_key'] for f in fields if f['text_content'] or f['file_id'])
+    
+    filled = set()
+    for f in fields:
+        # Проверяем что есть хоть какой-то контент
+        if f.get('text_content') or f.get('file_id'):
+            filled.add(f['field_key'])
+    
+    return filled
 
 # ============================================
 # DATABASE FUNCTIONS - BOOKINGS
@@ -2486,13 +2529,17 @@ async def preview_start(callback: types.CallbackQuery):
     apt_name = apt_info['name']
     
     async with db_pool.acquire() as conn:
+        # ИСПРАВЛЕН: получаем родительские категории
         sections_data = await conn.fetch('''
-            SELECT DISTINCT c.name as section_name
+            SELECT DISTINCT COALESCE(parent_cat.name, child_cat.name) as section_name
             FROM infos i
             JOIN infos_apartment_lnk ial ON i.id = ial.info_id
             JOIN infos_category_lnk icl ON i.id = icl.info_id
-            JOIN categories c ON icl.category_id = c.id
+            JOIN categories child_cat ON icl.category_id = child_cat.id
+            LEFT JOIN categories_parent_lnk cpl ON child_cat.id = cpl.category_id
+            LEFT JOIN categories parent_cat ON cpl.inv_category_id = parent_cat.id
             WHERE ial.apartment_id = $1
+            AND COALESCE(parent_cat.name, child_cat.name) IN ('Заселение', 'Аренда', 'Впечатления', 'Выселение')
         ''', apt_id)
     
     available_sections = set(row['section_name'] for row in sections_data)
@@ -2680,13 +2727,17 @@ async def guest_start(callback: types.CallbackQuery, state: FSMContext):
     apt_name = apt_info['name']
     
     async with db_pool.acquire() as conn:
+        # ИСПРАВЛЕН: получаем родительские категории
         sections_data = await conn.fetch('''
-            SELECT DISTINCT c.name as section_name
+            SELECT DISTINCT COALESCE(parent_cat.name, child_cat.name) as section_name
             FROM infos i
             JOIN infos_apartment_lnk ial ON i.id = ial.info_id
             JOIN infos_category_lnk icl ON i.id = icl.info_id
-            JOIN categories c ON icl.category_id = c.id
+            JOIN categories child_cat ON icl.category_id = child_cat.id
+            LEFT JOIN categories_parent_lnk cpl ON child_cat.id = cpl.category_id
+            LEFT JOIN categories parent_cat ON cpl.inv_category_id = parent_cat.id
             WHERE ial.apartment_id = $1
+            AND COALESCE(parent_cat.name, child_cat.name) IN ('Заселение', 'Аренда', 'Впечатления', 'Выселение')
         ''', apt_id)
     
     available_sections = set(row['section_name'] for row in sections_data)
