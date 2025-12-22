@@ -693,11 +693,11 @@ async def get_apartment_field(apt_id: int, section: str, field_key: str) -> Opti
         }
 
 async def get_section_fields(apt_id: int, section: str) -> List[Dict]:
-    """Получить все поля раздела с учетом иерархии категорий"""
+    """Получить все поля раздела с учетом иерархии категорий + кастомные"""
     section_name = SECTION_TO_CATEGORY_MAP.get(section, section)
     
     async with db_pool.acquire() as conn:
-        # ИСПРАВЛЕН: добавлен created_at в SELECT для ORDER BY
+        # Получаем обычные поля
         rows = await conn.fetch('''
             SELECT DISTINCT
                 i.id,
@@ -720,11 +720,39 @@ async def get_section_fields(apt_id: int, section: str) -> List[Dict]:
         
         result = []
         for row in rows:
-            # Генерируем field_key из категории
             field_key = row['category_name'].lower().replace(' ', '_').replace('ё', 'е')
             
             result.append({
                 'field_key': field_key,
+                'field_name': row['field_name'],
+                'text_content': row['text'],
+                'file_id': row['caption'],
+                'file_type': row['type']
+            })
+        
+        # Получаем кастомные поля для этого раздела
+        custom_rows = await conn.fetch('''
+            SELECT DISTINCT
+                i.id,
+                i.name as field_name,
+                i.text,
+                i.type,
+                i.caption,
+                c.name as category_name,
+                i.created_at
+            FROM infos i
+            JOIN infos_apartment_lnk ial ON i.id = ial.info_id
+            JOIN infos_category_lnk icl ON i.id = icl.info_id
+            JOIN categories c ON icl.category_id = c.id
+            WHERE ial.apartment_id = $1
+            AND c.name LIKE 'Кастом %'
+            ORDER BY i.created_at
+        ''', apt_id)
+        
+        # Добавляем кастомные поля
+        for row in custom_rows:
+            result.append({
+                'field_key': f"custom_{row['id']}",
                 'field_name': row['field_name'],
                 'text_content': row['text'],
                 'file_id': row['caption'],
@@ -874,6 +902,7 @@ def get_main_menu_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🏠 Добавление и настройка объектов", callback_data="objects_menu")],
         [InlineKeyboardButton(text="🏢 Личный кабинет компании", callback_data="organization_cabinet")],
+        [InlineKeyboardButton(text="♟️ Подключить шахматку", callback_data="connect_shahmatka")],
         [InlineKeyboardButton(text="💡 Что улучшить в боте", callback_data="suggest_improvement")]
     ])
 
@@ -954,7 +983,7 @@ def get_apartment_menu_keyboard(apt_id: int, is_long: bool = False):
     ])
 
 async def get_checkin_section_keyboard_async(apt_id: int, filled_fields: set = None):
-    """Клавиатура раздела Заселение"""
+    """Клавиатура раздела Заселение с кастомными кнопками"""
     filled_fields = filled_fields or set()
     
     def field_text(name: str, key: str) -> str:
@@ -975,88 +1004,211 @@ async def get_checkin_section_keyboard_async(apt_id: int, filled_fields: set = N
         [InlineKeyboardButton(text=field_text("📢 Правила", "rules"), callback_data=f"field_rules_{apt_id}")],
     ]
     
+    # Добавляем кастомные кнопки для раздела "Заселение"
+    custom_fields = await get_section_fields(apt_id, 'checkin')
+    for field in custom_fields:
+        if field['field_key'].startswith('custom_'):
+            field_name = field['field_name']
+            field_key = field['field_key']
+            
+            # Ограничиваем длину callback_data
+            safe_field_key = field_key[:30] if len(field_key) > 30 else field_key
+            callback_data = f"custom_field_{apt_id}_checkin_{safe_field_key}"
+            
+            if len(callback_data.encode('utf-8')) > 64:
+                import hashlib
+                field_hash = hashlib.md5(field_key.encode()).hexdigest()[:8]
+                callback_data = f"cust_f_{apt_id}_checkin_{field_hash}"
+            
+            buttons.append([InlineKeyboardButton(text=f"✨ {field_name}", callback_data=callback_data)])
+    
     buttons.append([InlineKeyboardButton(text="➕ Добавить кнопку", callback_data=f"add_custom_checkin_{apt_id}")])
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"apartment_{apt_id}")])
     
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_rent_section_keyboard(apt_id: int, filled_fields: set = None):
+async def get_rent_section_keyboard(apt_id: int, filled_fields: set = None):
+    """Клавиатура раздела Аренда с кастомными кнопками"""
     filled_fields = filled_fields or set()
     
     def field_text(name: str, key: str) -> str:
         return f"{name} ■" if key in filled_fields else name
     
-    return InlineKeyboardMarkup(inline_keyboard=[
+    buttons = [
         [InlineKeyboardButton(text=field_text("📱 Телефоны УК", "uk_phones"), callback_data=f"field_uk_phones_{apt_id}")],
         [InlineKeyboardButton(text=field_text("👨‍💼 Диспетчер", "dispatcher"), callback_data=f"field_dispatcher_{apt_id}")],
         [InlineKeyboardButton(text=field_text("🆘 Аварийка", "emergency"), callback_data=f"field_emergency_{apt_id}")],
         [InlineKeyboardButton(text=field_text("💬 Чаты", "chats"), callback_data=f"field_chats_{apt_id}")],
         [InlineKeyboardButton(text=field_text("📝 Обратная связь", "feedback_form"), callback_data=f"field_feedback_form_{apt_id}")],
         [InlineKeyboardButton(text=field_text("🌐 Интернет", "internet"), callback_data=f"field_internet_{apt_id}")],
-        [InlineKeyboardButton(text="➕ Добавить кнопку", callback_data=f"add_custom_rent_{apt_id}")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"apartment_{apt_id}")]
-    ])
+    ]
+    
+    # Добавляем кастомные кнопки
+    custom_fields = await get_section_fields(apt_id, 'rent')
+    for field in custom_fields:
+        if field['field_key'].startswith('custom_'):
+            field_name = field['field_name']
+            field_key = field['field_key']
+            
+            safe_field_key = field_key[:30] if len(field_key) > 30 else field_key
+            callback_data = f"custom_field_{apt_id}_rent_{safe_field_key}"
+            
+            if len(callback_data.encode('utf-8')) > 64:
+                import hashlib
+                field_hash = hashlib.md5(field_key.encode()).hexdigest()[:8]
+                callback_data = f"cust_f_{apt_id}_rent_{field_hash}"
+            
+            buttons.append([InlineKeyboardButton(text=f"✨ {field_name}", callback_data=callback_data)])
+    
+    buttons.append([InlineKeyboardButton(text="➕ Добавить кнопку", callback_data=f"add_custom_rent_{apt_id}")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"apartment_{apt_id}")])
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_help_subsection_keyboard(apt_id: int, filled_fields: set = None):
+async def get_help_subsection_keyboard(apt_id: int, filled_fields: set = None):
+    """Клавиатура подраздела Помощь с кастомными кнопками"""
     filled_fields = filled_fields or set()
     
     def field_text(name: str, key: str) -> str:
         return f"{name} ■" if key in filled_fields else name
     
-    return InlineKeyboardMarkup(inline_keyboard=[
+    buttons = [
         [InlineKeyboardButton(text=field_text("🥐 Завтрак", "breakfast"), callback_data=f"field_breakfast_{apt_id}")],
         [InlineKeyboardButton(text=field_text("🛏 Бельё", "linen"), callback_data=f"field_linen_{apt_id}")],
         [InlineKeyboardButton(text=field_text("📱 Менеджер", "manager_contact"), callback_data=f"field_manager_contact_{apt_id}")],
         [InlineKeyboardButton(text=field_text("📺 ТВ", "tv_setup"), callback_data=f"field_tv_setup_{apt_id}")],
         [InlineKeyboardButton(text=field_text("❄️ Кондиционер", "ac"), callback_data=f"field_ac_{apt_id}")],
-        [InlineKeyboardButton(text="➕ Добавить", callback_data=f"add_custom_help_{apt_id}")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"section_checkin_{apt_id}")]
-    ])
+    ]
+    
+    # Добавляем кастомные кнопки
+    custom_fields = await get_section_fields(apt_id, 'help')
+    for field in custom_fields:
+        if field['field_key'].startswith('custom_'):
+            field_name = field['field_name']
+            field_key = field['field_key']
+            
+            safe_field_key = field_key[:30] if len(field_key) > 30 else field_key
+            callback_data = f"custom_field_{apt_id}_help_{safe_field_key}"
+            
+            if len(callback_data.encode('utf-8')) > 64:
+                import hashlib
+                field_hash = hashlib.md5(field_key.encode()).hexdigest()[:8]
+                callback_data = f"cust_f_{apt_id}_help_{field_hash}"
+            
+            buttons.append([InlineKeyboardButton(text=f"✨ {field_name}", callback_data=callback_data)])
+    
+    buttons.append([InlineKeyboardButton(text="➕ Добавить", callback_data=f"add_custom_help_{apt_id}")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"section_checkin_{apt_id}")])
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_stores_subsection_keyboard(apt_id: int, filled_fields: set = None):
+async def get_stores_subsection_keyboard(apt_id: int, filled_fields: set = None):
+    """Клавиатура подраздела Магазины с кастомными кнопками"""
     filled_fields = filled_fields or set()
     
     def field_text(name: str, key: str) -> str:
         return f"{name} ■" if key in filled_fields else name
     
-    return InlineKeyboardMarkup(inline_keyboard=[
+    buttons = [
         [InlineKeyboardButton(text=field_text("🛒 Магазины", "shops"), callback_data=f"field_shops_{apt_id}")],
         [InlineKeyboardButton(text=field_text("🚗 Аренда авто", "car_rental"), callback_data=f"field_car_rental_{apt_id}")],
         [InlineKeyboardButton(text=field_text("🏃 Спорт", "sport"), callback_data=f"field_sport_{apt_id}")],
         [InlineKeyboardButton(text=field_text("💊 Больницы", "hospitals"), callback_data=f"field_hospitals_{apt_id}")],
-        [InlineKeyboardButton(text="➕ Добавить", callback_data=f"add_custom_stores_{apt_id}")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"section_checkin_{apt_id}")]
-    ])
+    ]
+    
+    # Добавляем кастомные кнопки
+    custom_fields = await get_section_fields(apt_id, 'stores')
+    for field in custom_fields:
+        if field['field_key'].startswith('custom_'):
+            field_name = field['field_name']
+            field_key = field['field_key']
+            
+            safe_field_key = field_key[:30] if len(field_key) > 30 else field_key
+            callback_data = f"custom_field_{apt_id}_stores_{safe_field_key}"
+            
+            if len(callback_data.encode('utf-8')) > 64:
+                import hashlib
+                field_hash = hashlib.md5(field_key.encode()).hexdigest()[:8]
+                callback_data = f"cust_f_{apt_id}_stores_{field_hash}"
+            
+            buttons.append([InlineKeyboardButton(text=f"✨ {field_name}", callback_data=callback_data)])
+    
+    buttons.append([InlineKeyboardButton(text="➕ Добавить", callback_data=f"add_custom_stores_{apt_id}")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"section_checkin_{apt_id}")])
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_experiences_section_keyboard(apt_id: int, filled_fields: set = None):
+async def get_experiences_section_keyboard(apt_id: int, filled_fields: set = None):
+    """Клавиатура раздела Впечатления с кастомными кнопками"""
     filled_fields = filled_fields or set()
     
     def field_text(name: str, key: str) -> str:
         return f"{name} ■" if key in filled_fields else name
     
-    return InlineKeyboardMarkup(inline_keyboard=[
+    buttons = [
         [InlineKeyboardButton(text=field_text("🗿 Экскурсии", "excursions"), callback_data=f"field_excursions_{apt_id}")],
         [InlineKeyboardButton(text=field_text("🏛 Музеи", "museums"), callback_data=f"field_museums_{apt_id}")],
         [InlineKeyboardButton(text=field_text("🌳 Парки", "parks"), callback_data=f"field_parks_{apt_id}")],
         [InlineKeyboardButton(text=field_text("🎬 Развлечения", "entertainment"), callback_data=f"field_entertainment_{apt_id}")],
-        [InlineKeyboardButton(text="➕ Добавить", callback_data=f"add_custom_exp_{apt_id}")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"apartment_{apt_id}")]
-    ])
+    ]
+    
+    # Добавляем кастомные кнопки
+    custom_fields = await get_section_fields(apt_id, 'experiences')
+    for field in custom_fields:
+        if field['field_key'].startswith('custom_'):
+            field_name = field['field_name']
+            field_key = field['field_key']
+            
+            safe_field_key = field_key[:30] if len(field_key) > 30 else field_key
+            callback_data = f"custom_field_{apt_id}_experiences_{safe_field_key}"
+            
+            if len(callback_data.encode('utf-8')) > 64:
+                import hashlib
+                field_hash = hashlib.md5(field_key.encode()).hexdigest()[:8]
+                callback_data = f"cust_f_{apt_id}_exp_{field_hash}"
+            
+            buttons.append([InlineKeyboardButton(text=f"✨ {field_name}", callback_data=callback_data)])
+    
+    buttons.append([InlineKeyboardButton(text="➕ Добавить", callback_data=f"add_custom_exp_{apt_id}")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"apartment_{apt_id}")])
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_checkout_section_keyboard(apt_id: int, filled_fields: set = None):
+async def get_checkout_section_keyboard(apt_id: int, filled_fields: set = None):
+    """Клавиатура раздела Выселение с кастомными кнопками"""
     filled_fields = filled_fields or set()
     
     def field_text(name: str, key: str) -> str:
         return f"{name} ■" if key in filled_fields else name
     
-    return InlineKeyboardMarkup(inline_keyboard=[
+    buttons = [
         [InlineKeyboardButton(text=field_text("🚪 Выезд без менеджера", "self_checkout"), callback_data=f"field_self_checkout_{apt_id}")],
         [InlineKeyboardButton(text=field_text("💸 Возврат депозита", "deposit_return"), callback_data=f"field_deposit_return_{apt_id}")],
         [InlineKeyboardButton(text=field_text("📅 Продление", "extend_stay"), callback_data=f"field_extend_stay_{apt_id}")],
         [InlineKeyboardButton(text=field_text("🎁 Скидки", "discounts"), callback_data=f"field_discounts_{apt_id}")],
-        [InlineKeyboardButton(text="➕ Добавить", callback_data=f"add_custom_checkout_{apt_id}")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"apartment_{apt_id}")]
-    ])
+    ]
+    
+    # Добавляем кастомные кнопки
+    custom_fields = await get_section_fields(apt_id, 'checkout')
+    for field in custom_fields:
+        if field['field_key'].startswith('custom_'):
+            field_name = field['field_name']
+            field_key = field['field_key']
+            
+            safe_field_key = field_key[:30] if len(field_key) > 30 else field_key
+            callback_data = f"custom_field_{apt_id}_checkout_{safe_field_key}"
+            
+            if len(callback_data.encode('utf-8')) > 64:
+                import hashlib
+                field_hash = hashlib.md5(field_key.encode()).hexdigest()[:8]
+                callback_data = f"cust_f_{apt_id}_checkout_{field_hash}"
+            
+            buttons.append([InlineKeyboardButton(text=f"✨ {field_name}", callback_data=callback_data)])
+    
+    buttons.append([InlineKeyboardButton(text="➕ Добавить", callback_data=f"add_custom_checkout_{apt_id}")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"apartment_{apt_id}")])
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def get_field_edit_keyboard(apt_id: int, section: str):
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -1558,7 +1710,7 @@ async def section_rent(callback: types.CallbackQuery):
     
     await callback.message.edit_text(
         "Раздел 📹 Аренда",
-        reply_markup=get_rent_section_keyboard(apt_id, filled_fields)
+        reply_markup=await get_rent_section_keyboard(apt_id, filled_fields)
     )
     await callback.answer()
 
@@ -1569,7 +1721,7 @@ async def subsection_help(callback: types.CallbackQuery):
     
     await callback.message.edit_text(
         "Подраздел 🏠 Помощь",
-        reply_markup=get_help_subsection_keyboard(apt_id, filled_fields)
+        reply_markup=await get_help_subsection_keyboard(apt_id, filled_fields)
     )
     await callback.answer()
 
@@ -1582,7 +1734,7 @@ async def section_help_redirect(callback: types.CallbackQuery):
     
     await callback.message.edit_text(
         "Подраздел 🏠 Помощь",
-        reply_markup=get_help_subsection_keyboard(apt_id, filled_fields)
+        reply_markup=await get_help_subsection_keyboard(apt_id, filled_fields)
     )
     await callback.answer("Обновлено")
 
@@ -1593,7 +1745,7 @@ async def subsection_stores(callback: types.CallbackQuery):
     
     await callback.message.edit_text(
         "Подраздел 📍 Магазины",
-        reply_markup=get_stores_subsection_keyboard(apt_id, filled_fields)
+        reply_markup=await get_stores_subsection_keyboard(apt_id, filled_fields)
     )
     await callback.answer()
 
@@ -1606,7 +1758,7 @@ async def section_stores_redirect(callback: types.CallbackQuery):
     
     await callback.message.edit_text(
         "Подраздел 📍 Магазины",
-        reply_markup=get_stores_subsection_keyboard(apt_id, filled_fields)
+        reply_markup=await get_stores_subsection_keyboard(apt_id, filled_fields)
     )
     await callback.answer("Обновлено")
 
@@ -1617,7 +1769,7 @@ async def section_experiences(callback: types.CallbackQuery):
     
     await callback.message.edit_text(
         "Раздел 🍿 Впечатления",
-        reply_markup=get_experiences_section_keyboard(apt_id, filled_fields)
+        reply_markup=await get_experiences_section_keyboard(apt_id, filled_fields)
     )
     await callback.answer()
 
@@ -1628,7 +1780,7 @@ async def section_checkout(callback: types.CallbackQuery):
     
     await callback.message.edit_text(
         "Раздел 📦 Выселение",
-        reply_markup=get_checkout_section_keyboard(apt_id, filled_fields)
+        reply_markup=await get_checkout_section_keyboard(apt_id, filled_fields)
     )
     await callback.answer()
 
@@ -1709,19 +1861,19 @@ async def process_field_content(message: types.Message, state: FSMContext):
     filled_fields = await get_filled_fields(apt_id, section)
     
     if section == "help":
-        keyboard = get_help_subsection_keyboard(apt_id, filled_fields)
+        keyboard = await get_help_subsection_keyboard(apt_id, filled_fields)
         text = "Подраздел 🏠 Помощь"
     elif section == "stores":
-        keyboard = get_stores_subsection_keyboard(apt_id, filled_fields)
+        keyboard = await get_stores_subsection_keyboard(apt_id, filled_fields)
         text = "Подраздел 📍 Магазины"
     elif section == "rent":
-        keyboard = get_rent_section_keyboard(apt_id, filled_fields)
+        keyboard = await get_rent_section_keyboard(apt_id, filled_fields)
         text = "Раздел 📹 Аренда"
     elif section == "experiences":
-        keyboard = get_experiences_section_keyboard(apt_id, filled_fields)
+        keyboard = await get_experiences_section_keyboard(apt_id, filled_fields)
         text = "Раздел 🍿 Впечатления"
     elif section == "checkout":
-        keyboard = get_checkout_section_keyboard(apt_id, filled_fields)
+        keyboard = await get_checkout_section_keyboard(apt_id, filled_fields)
         text = "Раздел 📦 Выселение"
     else:
         filled_checkin = await get_filled_fields(apt_id, 'checkin')
@@ -1743,23 +1895,23 @@ async def skip_field(callback: types.CallbackQuery, state: FSMContext):
     
     if section == "help":
         filled_fields = await get_filled_fields(apt_id, 'help')
-        keyboard = get_help_subsection_keyboard(apt_id, filled_fields)
+        keyboard = await get_help_subsection_keyboard(apt_id, filled_fields)
         text = "Подраздел 🏠 Помощь"
     elif section == "stores":
         filled_fields = await get_filled_fields(apt_id, 'stores')
-        keyboard = get_stores_subsection_keyboard(apt_id, filled_fields)
+        keyboard = await get_stores_subsection_keyboard(apt_id, filled_fields)
         text = "Подраздел 📍 Магазины"
     elif section == "rent":
         filled_fields = await get_filled_fields(apt_id, 'rent')
-        keyboard = get_rent_section_keyboard(apt_id, filled_fields)
+        keyboard = await get_rent_section_keyboard(apt_id, filled_fields)
         text = "Раздел 📹 Аренда"
     elif section == "experiences":
         filled_fields = await get_filled_fields(apt_id, 'experiences')
-        keyboard = get_experiences_section_keyboard(apt_id, filled_fields)
+        keyboard = await get_experiences_section_keyboard(apt_id, filled_fields)
         text = "Раздел 🍿 Впечатления"
     elif section == "checkout":
         filled_fields = await get_filled_fields(apt_id, 'checkout')
-        keyboard = get_checkout_section_keyboard(apt_id, filled_fields)
+        keyboard = await get_checkout_section_keyboard(apt_id, filled_fields)
         text = "Раздел 📦 Выселение"
     else:
         filled_checkin = await get_filled_fields(apt_id, 'checkin')
@@ -2321,19 +2473,19 @@ async def delete_custom_field_handler(callback: types.CallbackQuery):
         keyboard = await get_checkin_section_keyboard_async(apt_id, all_filled)
         text = "Раздел 🧳 Заселение"
     elif section == "rent":
-        keyboard = get_rent_section_keyboard(apt_id, filled_fields)
+        keyboard = await get_rent_section_keyboard(apt_id, filled_fields)
         text = "Раздел 📹 Аренда"
     elif section == "experiences":
-        keyboard = get_experiences_section_keyboard(apt_id, filled_fields)
+        keyboard = await get_experiences_section_keyboard(apt_id, filled_fields)
         text = "Раздел 🍿 Впечатления"
     elif section == "checkout":
-        keyboard = get_checkout_section_keyboard(apt_id, filled_fields)
+        keyboard = await get_checkout_section_keyboard(apt_id, filled_fields)
         text = "Раздел 📦 Выселение"
     elif section == "help":
-        keyboard = get_help_subsection_keyboard(apt_id, filled_fields)
+        keyboard = await get_help_subsection_keyboard(apt_id, filled_fields)
         text = "Подраздел 🏠 Помощь"
     else:
-        keyboard = get_stores_subsection_keyboard(apt_id, filled_fields)
+        keyboard = await get_stores_subsection_keyboard(apt_id, filled_fields)
         text = "Подраздел 📍 Магазины"
     
     await callback.message.edit_text(text, reply_markup=keyboard)
@@ -2376,6 +2528,93 @@ async def view_custom_field(callback: types.CallbackQuery):
     text = f"Кастомная кнопка: {row['name']}\n\n{preview_text}"
     
     await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
+
+# Обработчик для коротких callback кастомных полей (cust_f_)
+@dp.callback_query(F.data.startswith("cust_f_"))
+async def view_custom_field_short(callback: types.CallbackQuery):
+    """Обработчик для кастомных полей с хешированными callback"""
+    parts = callback.data.split("_")
+    # cust_f_{apt_id}_{section}_{hash}
+    apt_id = int(parts[2])
+    section = parts[3]
+    field_hash = parts[4]
+    
+    # Находим поле по хешу
+    custom_fields = await get_section_fields(apt_id, section)
+    
+    import hashlib
+    field_key = None
+    for field in custom_fields:
+        if field['field_key'].startswith('custom_'):
+            if hashlib.md5(field['field_key'].encode()).hexdigest()[:8] == field_hash:
+                field_key = field['field_key']
+                break
+    
+    if not field_key:
+        await callback.answer("Кнопка не найдена", show_alert=True)
+        return
+    
+    # Получаем info_id из field_key
+    info_id = int(field_key.split('_')[1])
+    
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow('''
+            SELECT name, text, type, caption
+            FROM infos
+            WHERE id = $1
+        ''', info_id)
+    
+    if not row:
+        await callback.answer("Кнопка не найдена", show_alert=True)
+        return
+    
+    # Определяем правильный callback для кнопки "Назад"
+    if section in ['help', 'stores']:
+        back_callback = f"subsection_{section}_{apt_id}"
+    else:
+        back_callback = f"section_{section}_{apt_id}"
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Назад", callback_data=back_callback)],
+        [InlineKeyboardButton(text="Удалить кнопку", callback_data=f"delete_custom_{apt_id}_{section}_{field_key}")]
+    ])
+    
+    text_content = row['text']
+    file_id = row['caption']
+    file_type = row['type']
+    
+    header = f"Кастомная кнопка: {row['name']}"
+    
+    # Если есть медиа - отправляем с медиа
+    if file_id:
+        try:
+            caption = f"{header}\n\n{text_content}" if text_content else header
+            
+            await callback.message.delete()
+            
+            if file_type == "photo":
+                await callback.message.answer_photo(file_id, caption=caption, reply_markup=keyboard)
+            elif file_type == "video":
+                await callback.message.answer_video(file_id, caption=caption, reply_markup=keyboard)
+            elif file_type == "document":
+                await callback.message.answer_document(file_id, caption=caption, reply_markup=keyboard)
+            
+            await callback.answer()
+            return
+        except Exception as e:
+            logger.error(f"Error sending media: {e}")
+    
+    # Только текст
+    preview_text = text_content[:50] + "..." if text_content and len(text_content) > 50 else text_content or "(контент)"
+    text = f"{header}\n\n{preview_text}"
+    
+    try:
+        await callback.message.edit_text(text, reply_markup=keyboard)
+    except:
+        await callback.message.delete()
+        await callback.message.answer(text, reply_markup=keyboard)
+    
     await callback.answer()
 
 # ============================================
@@ -3203,6 +3442,60 @@ async def suggest_improvement_start(callback: types.CallbackQuery, state: FSMCon
     
     await callback.message.edit_text(text, reply_markup=keyboard)
     await state.set_state(SuggestionStates.waiting_suggestion)
+    await callback.answer()
+
+@dp.callback_query(F.data == "connect_shahmatka")
+async def connect_shahmatka(callback: types.CallbackQuery, state: FSMContext):
+    """Генерация ссылки для подключения шахматки"""
+    data = await state.get_data()
+    org_id = data.get('current_organization_id')
+    
+    if not org_id:
+        organizations = await get_manager_organizations(callback.from_user.id)
+        if organizations:
+            org_id = organizations[0][0]
+            await state.update_data(current_organization_id=org_id)
+        else:
+            await callback.answer("⚠️ Создайте компанию сначала", show_alert=True)
+            await callback.message.edit_text(
+                "Создайте компанию",
+                reply_markup=get_add_organization_keyboard()
+            )
+            return
+    
+    # Получаем информацию об организации
+    org_info = await get_organization_info(org_id)
+    
+    if not org_info:
+        await callback.answer("⚠️ Организация не найдена", show_alert=True)
+        return
+    
+    # Используем hash как document_id
+    document_id = org_info['hash']
+    telegram_id = callback.from_user.id
+    
+    # Генерируем ссылку
+    shahmatka_url = f"https://app.podelu.pro/register?telegram={telegram_id}&organization={document_id}"
+    
+    text = (
+        f"♟️ Подключение шахматки для компании\n\n"
+        f"📋 **{org_info['name']}**\n"
+        f"🆔 Organization ID: `{document_id}`\n\n"
+        f"🔗 Ваша персональная ссылка для регистрации:\n\n"
+        f"{shahmatka_url}\n\n"
+        f"📱 Перейдите по ссылке для подключения шахматки к вашей компании."
+    )
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔗 Открыть ссылку", url=shahmatka_url)],
+        [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="main_menu")]
+    ])
+    
+    await callback.message.edit_text(
+        text, 
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
     await callback.answer()
 
 @dp.message(SuggestionStates.waiting_suggestion)
