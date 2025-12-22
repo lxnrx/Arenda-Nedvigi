@@ -1573,6 +1573,19 @@ async def subsection_help(callback: types.CallbackQuery):
     )
     await callback.answer()
 
+# Редирект для старых кнопок (section_help вместо subsection_help)
+@dp.callback_query(F.data.startswith("section_help_"))
+async def section_help_redirect(callback: types.CallbackQuery):
+    apt_id = int(callback.data.split("_")[2])
+    # Перенаправляем на правильный обработчик
+    filled_fields = await get_filled_fields(apt_id, 'help')
+    
+    await callback.message.edit_text(
+        "Подраздел 🏠 Помощь",
+        reply_markup=get_help_subsection_keyboard(apt_id, filled_fields)
+    )
+    await callback.answer("Обновлено")
+
 @dp.callback_query(F.data.startswith("subsection_stores_"))
 async def subsection_stores(callback: types.CallbackQuery):
     apt_id = int(callback.data.split("_")[2])
@@ -1583,6 +1596,19 @@ async def subsection_stores(callback: types.CallbackQuery):
         reply_markup=get_stores_subsection_keyboard(apt_id, filled_fields)
     )
     await callback.answer()
+
+# Редирект для старых кнопок (section_stores вместо subsection_stores)
+@dp.callback_query(F.data.startswith("section_stores_"))
+async def section_stores_redirect(callback: types.CallbackQuery):
+    apt_id = int(callback.data.split("_")[2])
+    # Перенаправляем на правильный обработчик
+    filled_fields = await get_filled_fields(apt_id, 'stores')
+    
+    await callback.message.edit_text(
+        "Подраздел 📍 Магазины",
+        reply_markup=get_stores_subsection_keyboard(apt_id, filled_fields)
+    )
+    await callback.answer("Обновлено")
 
 @dp.callback_query(F.data.startswith("section_experiences_"))
 async def section_experiences(callback: types.CallbackQuery):
@@ -2111,9 +2137,15 @@ async def add_custom_button_start(callback: types.CallbackQuery, state: FSMConte
         custom_apartment_id=apt_id
     )
     
+    # Определяем правильный callback для кнопки "Назад"
+    if section in ['help', 'stores']:
+        back_callback = f"subsection_{section}_{apt_id}"
+    else:
+        back_callback = f"section_{section}_{apt_id}"
+    
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"section_{section}_{apt_id}")],
-        [InlineKeyboardButton(text="⏭ Пропустить", callback_data=f"section_{section}_{apt_id}")]
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=back_callback)],
+        [InlineKeyboardButton(text="⏭ Пропустить", callback_data=back_callback)]
     ])
     
     await callback.message.edit_text(
@@ -2132,9 +2164,15 @@ async def process_custom_button_name(message: types.Message, state: FSMContext):
     
     await state.update_data(custom_button_name=custom_name)
     
+    # Определяем правильный callback для кнопки "Назад"
+    if section in ['help', 'stores']:
+        back_callback = f"subsection_{section}_{apt_id}"
+    else:
+        back_callback = f"section_{section}_{apt_id}"
+    
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"section_{section}_{apt_id}")],
-        [InlineKeyboardButton(text="⏭ Пропустить", callback_data=f"section_{section}_{apt_id}")]
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=back_callback)],
+        [InlineKeyboardButton(text="⏭ Пропустить", callback_data=back_callback)]
     ])
     
     await message.answer(
@@ -2175,10 +2213,16 @@ async def process_custom_button_content(message: types.Message, state: FSMContex
         custom_file_type=file_type
     )
     
+    # Определяем правильный callback для кнопки "Назад"
+    if section in ['help', 'stores']:
+        back_callback = f"subsection_{section}_{apt_id}"
+    else:
+        back_callback = f"section_{section}_{apt_id}"
+    
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Назад", callback_data=f"section_{section}_{apt_id}")],
+        [InlineKeyboardButton(text="Назад", callback_data=back_callback)],
         [InlineKeyboardButton(text="Сохранить", callback_data=f"save_custom_{section}_{apt_id}")],
-        [InlineKeyboardButton(text="Не сохранять", callback_data=f"section_{section}_{apt_id}")]
+        [InlineKeyboardButton(text="Не сохранять", callback_data=back_callback)]
     ])
     
     await message.answer(
@@ -2239,8 +2283,14 @@ async def save_custom_field(callback: types.CallbackQuery, state: FSMContext):
     # Показываем страницу кастомной кнопки
     field_key = f"custom_{info_id}"
     
+    # Определяем правильный callback для кнопки "Назад"
+    if section in ['help', 'stores']:
+        back_callback = f"subsection_{section}_{apt_id}"
+    else:
+        back_callback = f"section_{section}_{apt_id}"
+    
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Назад", callback_data=f"section_{section}_{apt_id}")],
+        [InlineKeyboardButton(text="Назад", callback_data=back_callback)],
         [InlineKeyboardButton(text="Удалить кнопку", callback_data=f"delete_custom_{apt_id}_{section}_{field_key}")]
     ])
     
@@ -2309,8 +2359,14 @@ async def view_custom_field(callback: types.CallbackQuery):
         await callback.answer("Кнопка не найдена", show_alert=True)
         return
     
+    # Определяем правильный callback для кнопки "Назад"
+    if section in ['help', 'stores']:
+        back_callback = f"subsection_{section}_{apt_id}"
+    else:
+        back_callback = f"section_{section}_{apt_id}"
+    
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Назад", callback_data=f"section_{section}_{apt_id}")],
+        [InlineKeyboardButton(text="Назад", callback_data=back_callback)],
         [InlineKeyboardButton(text="Удалить кнопку", callback_data=f"delete_custom_{apt_id}_{section}_{field_key}")]
     ])
     
