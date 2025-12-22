@@ -2581,7 +2581,21 @@ async def preview_section(callback: types.CallbackQuery):
     
     for field in fields:
         field_name = field['field_name']
-        buttons.append([InlineKeyboardButton(text=field_name, callback_data=f"prevw_field_{apt_id}_{section}_{field['field_key']}")])
+        field_key = field['field_key']
+        
+        # Ограничиваем длину callback_data (Telegram лимит 64 байта)
+        # Используем только первые 30 символов field_key
+        safe_field_key = field_key[:30] if len(field_key) > 30 else field_key
+        callback_data = f"prevw_field_{apt_id}_{section}_{safe_field_key}"
+        
+        # Проверяем длину callback_data
+        if len(callback_data.encode('utf-8')) > 64:
+            # Если всё равно длинный - используем хеш
+            import hashlib
+            field_hash = hashlib.md5(field_key.encode()).hexdigest()[:8]
+            callback_data = f"prevw_f_{apt_id}_{section}_{field_hash}"
+        
+        buttons.append([InlineKeyboardButton(text=field_name, callback_data=callback_data)])
     
     if section == 'checkin':
         help_fields = await get_section_fields(apt_id, 'help')
@@ -2618,7 +2632,17 @@ async def preview_subsection_help(callback: types.CallbackQuery):
     buttons = []
     for field in fields:
         field_name = field['field_name']
-        buttons.append([InlineKeyboardButton(text=field_name, callback_data=f"prevw_field_{apt_id}_help_{field['field_key']}")])
+        field_key = field['field_key']
+        
+        safe_field_key = field_key[:30] if len(field_key) > 30 else field_key
+        callback_data = f"prevw_field_{apt_id}_help_{safe_field_key}"
+        
+        if len(callback_data.encode('utf-8')) > 64:
+            import hashlib
+            field_hash = hashlib.md5(field_key.encode()).hexdigest()[:8]
+            callback_data = f"prevw_f_{apt_id}_help_{field_hash}"
+        
+        buttons.append([InlineKeyboardButton(text=field_name, callback_data=callback_data)])
     
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"prevw_section_checkin_{apt_id}")])
     
@@ -2642,7 +2666,17 @@ async def preview_subsection_stores(callback: types.CallbackQuery):
     buttons = []
     for field in fields:
         field_name = field['field_name']
-        buttons.append([InlineKeyboardButton(text=field_name, callback_data=f"prevw_field_{apt_id}_stores_{field['field_key']}")])
+        field_key = field['field_key']
+        
+        safe_field_key = field_key[:30] if len(field_key) > 30 else field_key
+        callback_data = f"prevw_field_{apt_id}_stores_{safe_field_key}"
+        
+        if len(callback_data.encode('utf-8')) > 64:
+            import hashlib
+            field_hash = hashlib.md5(field_key.encode()).hexdigest()[:8]
+            callback_data = f"prevw_f_{apt_id}_stores_{field_hash}"
+        
+        buttons.append([InlineKeyboardButton(text=field_name, callback_data=callback_data)])
     
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"prevw_section_checkin_{apt_id}")])
     
@@ -2651,12 +2685,38 @@ async def preview_subsection_stores(callback: types.CallbackQuery):
     await callback.message.edit_text(text, reply_markup=keyboard)
     await callback.answer()
 
-@dp.callback_query(F.data.startswith("prevw_field_"))
+@dp.callback_query(F.data.startswith("prevw_field_") | F.data.startswith("prevw_f_"))
 async def preview_field(callback: types.CallbackQuery):
     parts = callback.data.split("_")
-    apt_id = int(parts[2])
-    section = parts[3]
-    field_key = "_".join(parts[4:])
+    
+    # Поддержка обоих форматов: prevw_field и prevw_f (хешированный)
+    if callback.data.startswith("prevw_f_"):
+        # Формат: prevw_f_{apt_id}_{section}_{hash}
+        apt_id = int(parts[2])
+        section = parts[3]
+        field_hash = parts[4]
+        
+        # Находим поле по хешу (пока просто берём первое)
+        fields = await get_section_fields(apt_id, section)
+        if not fields:
+            await callback.answer("Нет данных", show_alert=True)
+            return
+        
+        # Ищем поле по хешу
+        import hashlib
+        field_key = None
+        for f in fields:
+            if hashlib.md5(f['field_key'].encode()).hexdigest()[:8] == field_hash:
+                field_key = f['field_key']
+                break
+        
+        if not field_key:
+            field_key = fields[0]['field_key']  # Fallback
+    else:
+        # Формат: prevw_field_{apt_id}_{section}_{field_key}
+        apt_id = int(parts[2])
+        section = parts[3]
+        field_key = "_".join(parts[4:])
     
     field_data = await get_apartment_field(apt_id, section, field_key)
     
@@ -2664,7 +2724,17 @@ async def preview_field(callback: types.CallbackQuery):
         await callback.answer("Нет данных", show_alert=True)
         return
     
-    field_name = FIELD_NAMES.get(field_key, "Поле")
+    # Получаем красивое название из FIELD_NAMES или используем название из БД
+    field_name = FIELD_NAMES.get(field_key)
+    if not field_name:
+        # Если не нашли в маппинге - берём из БД
+        fields = await get_section_fields(apt_id, section)
+        for f in fields:
+            if f['field_key'] == field_key:
+                field_name = f['field_name']
+                break
+        if not field_name:
+            field_name = field_key.replace('_', ' ').title()
     
     text_content = field_data['text_content']
     file_id = field_data['file_id']
@@ -2680,24 +2750,43 @@ async def preview_field(callback: types.CallbackQuery):
         try:
             caption = f"{header}\n\n{text_content}" if text_content else header
             
+            # Удаляем старое сообщение и отправляем новое с медиа
+            await callback.message.delete()
+            
             if file_type == "photo":
-                await callback.message.delete()
                 await callback.message.answer_photo(file_id, caption=caption, reply_markup=keyboard)
             elif file_type == "video":
-                await callback.message.delete()
                 await callback.message.answer_video(file_id, caption=caption, reply_markup=keyboard)
             elif file_type == "document":
-                await callback.message.delete()
                 await callback.message.answer_document(file_id, caption=caption, reply_markup=keyboard)
+            
+            await callback.answer()
+            return
+            
         except Exception as e:
             logger.error(f"Error sending media: {e}")
+            # Fallback к текстовому сообщению
             full_text = f"{header}\n\n{text_content}" if text_content else header
-            await callback.message.edit_text(full_text, reply_markup=keyboard)
-    elif text_content:
+            try:
+                await callback.message.delete()
+                await callback.message.answer(full_text, reply_markup=keyboard)
+            except:
+                await callback.message.edit_text(full_text, reply_markup=keyboard)
+            await callback.answer()
+            return
+    
+    # Только текст
+    if text_content:
         full_text = f"{header}\n\n{text_content}"
-        await callback.message.edit_text(full_text, reply_markup=keyboard)
     else:
-        await callback.message.edit_text(header, reply_markup=keyboard)
+        full_text = header
+    
+    try:
+        await callback.message.edit_text(full_text, reply_markup=keyboard)
+    except Exception as e:
+        # Если не можем отредактировать (например сообщение с фото) - отправляем новое
+        await callback.message.delete()
+        await callback.message.answer(full_text, reply_markup=keyboard)
     
     await callback.answer()
 
@@ -2782,7 +2871,18 @@ async def guest_view_section(callback: types.CallbackQuery):
     
     for field in fields:
         field_name = field['field_name']
-        buttons.append([InlineKeyboardButton(text=field_name, callback_data=f"guest_field_{apt_id}_{section}_{field['field_key']}")])
+        field_key = field['field_key']
+        
+        # Ограничиваем длину callback_data
+        safe_field_key = field_key[:30] if len(field_key) > 30 else field_key
+        callback_data = f"guest_field_{apt_id}_{section}_{safe_field_key}"
+        
+        if len(callback_data.encode('utf-8')) > 64:
+            import hashlib
+            field_hash = hashlib.md5(field_key.encode()).hexdigest()[:8]
+            callback_data = f"guest_f_{apt_id}_{section}_{field_hash}"
+        
+        buttons.append([InlineKeyboardButton(text=field_name, callback_data=callback_data)])
     
     if section == 'checkin':
         help_fields = await get_section_fields(apt_id, 'help')
@@ -2819,7 +2919,17 @@ async def guest_subsection_help(callback: types.CallbackQuery):
     buttons = []
     for field in fields:
         field_name = field['field_name']
-        buttons.append([InlineKeyboardButton(text=field_name, callback_data=f"guest_field_{apt_id}_help_{field['field_key']}")])
+        field_key = field['field_key']
+        
+        safe_field_key = field_key[:30] if len(field_key) > 30 else field_key
+        callback_data = f"guest_field_{apt_id}_help_{safe_field_key}"
+        
+        if len(callback_data.encode('utf-8')) > 64:
+            import hashlib
+            field_hash = hashlib.md5(field_key.encode()).hexdigest()[:8]
+            callback_data = f"guest_f_{apt_id}_help_{field_hash}"
+        
+        buttons.append([InlineKeyboardButton(text=field_name, callback_data=callback_data)])
     
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"guest_section_checkin_{apt_id}")])
     
@@ -2843,7 +2953,17 @@ async def guest_subsection_stores(callback: types.CallbackQuery):
     buttons = []
     for field in fields:
         field_name = field['field_name']
-        buttons.append([InlineKeyboardButton(text=field_name, callback_data=f"guest_field_{apt_id}_stores_{field['field_key']}")])
+        field_key = field['field_key']
+        
+        safe_field_key = field_key[:30] if len(field_key) > 30 else field_key
+        callback_data = f"guest_field_{apt_id}_stores_{safe_field_key}"
+        
+        if len(callback_data.encode('utf-8')) > 64:
+            import hashlib
+            field_hash = hashlib.md5(field_key.encode()).hexdigest()[:8]
+            callback_data = f"guest_f_{apt_id}_stores_{field_hash}"
+        
+        buttons.append([InlineKeyboardButton(text=field_name, callback_data=callback_data)])
     
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"guest_section_checkin_{apt_id}")])
     
@@ -2852,12 +2972,34 @@ async def guest_subsection_stores(callback: types.CallbackQuery):
     await callback.message.edit_text(text, reply_markup=keyboard)
     await callback.answer()
 
-@dp.callback_query(F.data.startswith("guest_field_"))
+@dp.callback_query(F.data.startswith("guest_field_") | F.data.startswith("guest_f_"))
 async def guest_view_field(callback: types.CallbackQuery):
     parts = callback.data.split("_")
-    apt_id = int(parts[2])
-    section = parts[3]
-    field_key = "_".join(parts[4:])
+    
+    # Поддержка обоих форматов
+    if callback.data.startswith("guest_f_"):
+        apt_id = int(parts[2])
+        section = parts[3]
+        field_hash = parts[4]
+        
+        fields = await get_section_fields(apt_id, section)
+        if not fields:
+            await callback.answer("Нет данных", show_alert=True)
+            return
+        
+        import hashlib
+        field_key = None
+        for f in fields:
+            if hashlib.md5(f['field_key'].encode()).hexdigest()[:8] == field_hash:
+                field_key = f['field_key']
+                break
+        
+        if not field_key:
+            field_key = fields[0]['field_key']
+    else:
+        apt_id = int(parts[2])
+        section = parts[3]
+        field_key = "_".join(parts[4:])
     
     field_data = await get_apartment_field(apt_id, section, field_key)
     
@@ -2865,7 +3007,16 @@ async def guest_view_field(callback: types.CallbackQuery):
         await callback.answer("Нет данных", show_alert=True)
         return
     
-    field_name = FIELD_NAMES.get(field_key, "Поле")
+    # Получаем красивое название
+    field_name = FIELD_NAMES.get(field_key)
+    if not field_name:
+        fields = await get_section_fields(apt_id, section)
+        for f in fields:
+            if f['field_key'] == field_key:
+                field_name = f['field_name']
+                break
+        if not field_name:
+            field_name = field_key.replace('_', ' ').title()
     
     text_content = field_data['text_content']
     file_id = field_data['file_id']
@@ -2881,24 +3032,39 @@ async def guest_view_field(callback: types.CallbackQuery):
         try:
             caption = f"{header}\n\n{text_content}" if text_content else header
             
+            await callback.message.delete()
+            
             if file_type == "photo":
-                await callback.message.delete()
                 await callback.message.answer_photo(file_id, caption=caption, reply_markup=keyboard)
             elif file_type == "video":
-                await callback.message.delete()
                 await callback.message.answer_video(file_id, caption=caption, reply_markup=keyboard)
             elif file_type == "document":
-                await callback.message.delete()
                 await callback.message.answer_document(file_id, caption=caption, reply_markup=keyboard)
+            
+            await callback.answer()
+            return
+            
         except Exception as e:
             logger.error(f"Error sending media: {e}")
             full_text = f"{header}\n\n{text_content}" if text_content else header
-            await callback.message.edit_text(full_text, reply_markup=keyboard)
-    elif text_content:
+            try:
+                await callback.message.delete()
+                await callback.message.answer(full_text, reply_markup=keyboard)
+            except:
+                await callback.message.edit_text(full_text, reply_markup=keyboard)
+            await callback.answer()
+            return
+    
+    if text_content:
         full_text = f"{header}\n\n{text_content}"
-        await callback.message.edit_text(full_text, reply_markup=keyboard)
     else:
-        await callback.message.edit_text(header, reply_markup=keyboard)
+        full_text = header
+    
+    try:
+        await callback.message.edit_text(full_text, reply_markup=keyboard)
+    except Exception as e:
+        await callback.message.delete()
+        await callback.message.answer(full_text, reply_markup=keyboard)
     
     await callback.answer()
 
