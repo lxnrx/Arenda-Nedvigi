@@ -3478,12 +3478,11 @@ async def connect_shahmatka(callback: types.CallbackQuery, state: FSMContext):
     shahmatka_url = f"https://app.podelu.pro/register?telegram={telegram_id}&organization={document_id}"
     
     text = (
-        f"♟️ Подключение шахматки для компании\n\n"
-        f"📋 **{org_info['name']}**\n"
-        f"🆔 Organization ID: `{document_id}`\n\n"
-        f"🔗 Ваша персональная ссылка для регистрации:\n\n"
+        f"♟️ Подключение шахматки\n\n"
+        f"📋 Компания: {org_info['name']}\n\n"
+        f"🔗 Ваша персональная ссылка для регистрации:\n"
         f"{shahmatka_url}\n\n"
-        f"📱 Перейдите по ссылке для подключения шахматки к вашей компании."
+        f"📱 Нажмите кнопку ниже для подключения шахматки к вашей компании."
     )
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -3491,11 +3490,7 @@ async def connect_shahmatka(callback: types.CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="main_menu")]
     ])
     
-    await callback.message.edit_text(
-        text, 
-        reply_markup=keyboard,
-        parse_mode="Markdown"
-    )
+    await callback.message.edit_text(text, reply_markup=keyboard)
     await callback.answer()
 
 @dp.message(SuggestionStates.waiting_suggestion)
