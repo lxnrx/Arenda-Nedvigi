@@ -205,8 +205,6 @@ async def auto_register_manager_middleware(handler, event: types.Update, data: d
                             created_at, updated_at, published_at
                         )
                         VALUES ($1, $2, $3, NOW(), NOW(), NOW())
-                        ON CONFLICT (telegram_id) DO UPDATE
-                        SET name = EXCLUDED.name, updated_at = NOW()
                     ''', telegram_id_str, user.first_name, user.username or '')
                     
         except Exception as e:
@@ -2487,14 +2485,15 @@ async def preview_start(callback: types.CallbackQuery):
     apt_info = await get_apartment_info(apt_id)
     apt_name = apt_info['name']
     
-    sections_data = await conn.fetch('''
-        SELECT DISTINCT c.name as section_name
-        FROM infos i
-        JOIN infos_apartment_lnk ial ON i.id = ial.info_id
-        JOIN infos_category_lnk icl ON i.id = icl.info_id
-        JOIN categories c ON icl.category_id = c.id
-        WHERE ial.apartment_id = $1
-    ''', apt_id)
+    async with db_pool.acquire() as conn:
+        sections_data = await conn.fetch('''
+            SELECT DISTINCT c.name as section_name
+            FROM infos i
+            JOIN infos_apartment_lnk ial ON i.id = ial.info_id
+            JOIN infos_category_lnk icl ON i.id = icl.info_id
+            JOIN categories c ON icl.category_id = c.id
+            WHERE ial.apartment_id = $1
+        ''', apt_id)
     
     available_sections = set(row['section_name'] for row in sections_data)
     
