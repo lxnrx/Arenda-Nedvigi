@@ -1,4 +1,4 @@
-name: Deploy to Yandex Cloud
+name: Deploy to Yandex Cloud VDS
 
 on:
   push:
@@ -13,7 +13,7 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v3
     
-    - name: Deploy to server
+    - name: Deploy to VDS
       uses: appleboy/ssh-action@master
       with:
         host: ${{ secrets.VPS_HOST }}
@@ -33,12 +33,17 @@ jobs:
           # Останавливаем старые контейнеры
           docker compose down || true
           
-          # Создаем .env файл
+          # Создаем .env файл с Strapi БД
           cat > .env << EOF
           BOT_TOKEN=${{ secrets.BOT_TOKEN }}
-          DATABASE_URL=${{ secrets.DATABASE_URL }}
+          DATABASE_URL=postgresql://j7uEsy7a1j8PYCfi:PF6NZlOsCLxrWmuSWIcn0D5GYHYXa5B7@130.193.52.195:5555/strapi
           PORT=8080
           EOF
+          
+          # Копируем правильные файлы (используем Strapi версии)
+          cp bot_strapi.py bot.py
+          cp Dockerfile_strapi Dockerfile
+          cp docker-compose_strapi.yml docker-compose.yml
           
           # Запускаем через docker compose
           docker compose up -d --build
