@@ -840,6 +840,32 @@ async def get_organization_managers(org_id: int) -> List[Dict]:
         
         return result
 
+async def get_bot_admins() -> List[int]:
+    """Получить список telegram_id админов бота из admin_users (кроме id=1)"""
+    async with db_pool.acquire() as conn:
+        # Пытаемся найти telegram_id в разных возможных полях
+        rows = await conn.fetch('''
+            SELECT 
+                CASE 
+                    WHEN username ~ '^[0-9]+$' THEN username::bigint
+                    WHEN email ~ '^[0-9]+$' THEN email::bigint
+                    ELSE NULL
+                END as telegram_id
+            FROM admin_users 
+            WHERE id != 1
+            AND (
+                (username IS NOT NULL AND username ~ '^[0-9]+$')
+                OR (email IS NOT NULL AND email ~ '^[0-9]+$')
+            )
+        ''')
+        
+        admin_ids = []
+        for row in rows:
+            if row['telegram_id']:
+                admin_ids.append(int(row['telegram_id']))
+        
+        return admin_ids
+
 # ============================================
 # KEYBOARD FUNCTIONS
 # ============================================
@@ -2584,13 +2610,11 @@ async def preview_section(callback: types.CallbackQuery):
         field_key = field['field_key']
         
         # Ограничиваем длину callback_data (Telegram лимит 64 байта)
-        # Используем только первые 30 символов field_key
         safe_field_key = field_key[:30] if len(field_key) > 30 else field_key
         callback_data = f"prevw_field_{apt_id}_{section}_{safe_field_key}"
         
         # Проверяем длину callback_data
         if len(callback_data.encode('utf-8')) > 64:
-            # Если всё равно длинный - используем хеш
             import hashlib
             field_hash = hashlib.md5(field_key.encode()).hexdigest()[:8]
             callback_data = f"prevw_f_{apt_id}_{section}_{field_hash}"
@@ -2614,7 +2638,16 @@ async def preview_section(callback: types.CallbackQuery):
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     
-    await callback.message.edit_text(text, reply_markup=keyboard)
+    # Проверяем тип сообщения - если это фото/видео, удаляем и создаем новое
+    if callback.message.photo or callback.message.video or callback.message.document:
+        try:
+            await callback.message.delete()
+            await callback.message.answer(text, reply_markup=keyboard)
+        except:
+            await callback.message.edit_caption(caption=text, reply_markup=keyboard)
+    else:
+        await callback.message.edit_text(text, reply_markup=keyboard)
+    
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("prevw_subsection_help_"))
@@ -2901,7 +2934,16 @@ async def guest_view_section(callback: types.CallbackQuery):
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     
-    await callback.message.edit_text(text, reply_markup=keyboard)
+    # Проверяем тип сообщения - если это фото/видео, удаляем и создаем новое
+    if callback.message.photo or callback.message.video or callback.message.document:
+        try:
+            await callback.message.delete()
+            await callback.message.answer(text, reply_markup=keyboard)
+        except:
+            await callback.message.edit_caption(caption=text, reply_markup=keyboard)
+    else:
+        await callback.message.edit_text(text, reply_markup=keyboard)
+    
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("guest_subsection_help_"))
@@ -3130,7 +3172,31 @@ async def process_suggestion(message: types.Message, state: FSMContext):
         return
     
     # Сохраняем в лог
-    logger.info(f"💡 Suggestion from {message.from_user.id} ({message.from_user.username}): {suggestion_text}")
+    user_info = f"{message.from_user.id} (@{message.from_user.username or 'no_username'})"
+    logger.info(f"💡 Suggestion from {user_info}: {suggestion_text}")
+    
+    # Отправляем админам
+    admins = await get_bot_admins()
+    
+    if admins:
+        notification_text = (
+            f"💡 Новое предложение по улучшению бота\n\n"
+            f"От: {message.from_user.first_name} (@{message.from_user.username or 'no_username'})\n"
+            f"ID: {message.from_user.id}\n\n"
+            f"Предложение:\n{suggestion_text}"
+        )
+        
+        sent_count = 0
+        for admin_id in admins:
+            try:
+                await bot.send_message(admin_id, notification_text)
+                sent_count += 1
+            except Exception as e:
+                logger.error(f"Failed to send suggestion to admin {admin_id}: {e}")
+        
+        logger.info(f"✅ Suggestion sent to {sent_count}/{len(admins)} admins")
+    else:
+        logger.warning("⚠️ No bot admins found in admin_users table")
     
     await message.answer(
         "✅ Спасибо за предложение!\n\nВаше сообщение отправлено разработчикам.",
