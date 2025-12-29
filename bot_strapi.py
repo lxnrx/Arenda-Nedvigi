@@ -38,6 +38,19 @@ dp = Dispatcher(storage=storage)
 db_pool: Optional[asyncpg.Pool] = None
 
 # ============================================
+# HELPER ФУНКЦИЯ ДЛЯ БЕЗОПАСНОЙ ОБРАБОТКИ NULL
+# ============================================
+
+def safe_str(value, default: str = "") -> str:
+    """
+    Безопасно конвертирует значение в строку.
+    Если значение None - возвращает default.
+    """
+    if value is None:
+        return default
+    return str(value)
+
+# ============================================
 # КОНСТАНТЫ ДЛЯ МАППИНГА РАЗДЕЛОВ И КАТЕГОРИЙ
 # ============================================
 
@@ -205,7 +218,7 @@ async def auto_register_manager_middleware(handler, event: types.Update, data: d
                             created_at, updated_at, published_at
                         )
                         VALUES ($1, $2, $3, NOW(), NOW(), NOW())
-                    ''', telegram_id_str, user.first_name, user.username or '')
+                    ''', telegram_id_str, user.first_name or 'User', user.username or '')
                     
         except Exception as e:
             logger.error(f"⚠️ Error auto-registering manager {user.id}: {e}")
@@ -473,17 +486,26 @@ async def join_organization_by_hash(telegram_id: int, hash_code: str) -> Optiona
 # ============================================
 
 async def get_organization_apartments(org_id: int) -> List[Tuple[int, str, str, bool]]:
-    """Получить список квартир организации"""
+    """
+    Получить список квартир организации.
+    ИСПРАВЛЕНО: используем INNER JOIN с apartments_organization_lnk
+    для фильтрации только объектов этой организации.
+    """
     async with db_pool.acquire() as conn:
         rows = await conn.fetch('''
-            SELECT a.id, a.name, a.address, a.is_long
+            SELECT DISTINCT 
+                a.id, 
+                a.name, 
+                a.address, 
+                COALESCE(a.is_long, FALSE) as is_long
             FROM apartments a
-            JOIN apartments_organization_lnk aol ON a.id = aol.apartment_id
+            INNER JOIN apartments_organization_lnk aol ON a.id = aol.apartment_id
             WHERE aol.organization_id = $1
+            AND a.published_at IS NOT NULL
             ORDER BY a.created_at DESC
         ''', org_id)
         
-        return [(row['id'], row['name'], row['address'] or '', row['is_long']) for row in rows]
+        return [(row['id'], row['name'], row['address'], row['is_long']) for row in rows]
 
 async def create_apartment(org_id: int, name: str, address: str) -> int:
     """Создать новую квартиру"""
@@ -511,7 +533,7 @@ async def get_apartment_info(apt_id: int) -> Optional[Dict]:
     """Получить информацию о квартире"""
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow('''
-            SELECT a.id, a.name, a.address, a.is_long,
+            SELECT a.id, a.name, a.address, COALESCE(a.is_long, FALSE) as is_long,
                    aol.organization_id
             FROM apartments a
             LEFT JOIN apartments_organization_lnk aol ON a.id = aol.apartment_id
@@ -525,7 +547,7 @@ async def toggle_apartment_term(apt_id: int):
     async with db_pool.acquire() as conn:
         await conn.execute('''
             UPDATE apartments 
-            SET is_long = NOT is_long, updated_at = NOW()
+            SET is_long = NOT COALESCE(is_long, FALSE), updated_at = NOW()
             WHERE id = $1
         ''', apt_id)
 
@@ -593,7 +615,15 @@ async def save_apartment_field(
     file_id: str = None,
     file_type: str = None
 ):
-    """Сохранить информацию о квартире"""
+    """
+    Сохранить информацию о квартире.
+    ДОБАВЛЕНО: валидация - не сохраняем если нет контента.
+    """
+    # Валидация: не сохраняем пустые записи
+    if not text_content and not file_id:
+        logger.warning(f"⚠️ Attempted to save empty field {field_key} for apartment {apt_id}")
+        return
+    
     async with db_pool.acquire() as conn:
         # Получаем или создаём категории
         section_name = SECTION_TO_CATEGORY_MAP.get(section, section)
@@ -616,9 +646,10 @@ async def save_apartment_field(
             # Обновляем существующий
             await conn.execute('''
                 UPDATE infos 
-                SET name = $1, text = $2, type = $3, updated_at = NOW()
-                WHERE id = $4
-            ''', field_name, text_content, file_type or 'text', info_id)
+                SET name = $1, text = $2, type = $3, caption = $4, updated_at = NOW()
+                WHERE id = $5
+            ''', field_name, text_content, file_type or 'text', file_id, info_id)
+            logger.info(f"✅ Updated field {field_key} for apartment {apt_id}")
         else:
             # Создаём новый
             info_id = await conn.fetchval('''
@@ -641,6 +672,8 @@ async def save_apartment_field(
                 INSERT INTO infos_category_lnk (info_id, category_id)
                 VALUES ($1, $2)
             ''', info_id, field_cat_id)
+            
+            logger.info(f"✅ Created field {field_key} for apartment {apt_id}")
 
 async def get_apartment_field(apt_id: int, section: str, field_key: str) -> Optional[Dict]:
     """Получить информацию о конкретном поле квартиры"""
@@ -669,7 +702,6 @@ async def get_apartment_field(apt_id: int, section: str, field_key: str) -> Opti
                 }
         
         # Если не нашли - пробуем через поиск по названию
-        # Преобразуем field_key обратно в название
         search_name = field_key.replace('_', ' ').title()
         
         row = await conn.fetchrow('''
@@ -762,13 +794,19 @@ async def get_section_fields(apt_id: int, section: str) -> List[Dict]:
         return result
 
 async def get_filled_fields(apt_id: int, section: str) -> set:
-    """Получить список заполненных полей раздела"""
+    """
+    Получить список заполненных полей раздела.
+    НОВАЯ ФУНКЦИЯ для индикаторов заполненности ■
+    """
     fields = await get_section_fields(apt_id, section)
     
     filled = set()
     for f in fields:
         # Проверяем что есть хоть какой-то контент
-        if f.get('text_content') or f.get('file_id'):
+        text = f.get('text_content')
+        file_id = f.get('file_id')
+        
+        if (text and text.strip()) or file_id:
             filled.add(f['field_key'])
     
     return filled
@@ -809,10 +847,10 @@ async def get_apartment_bookings(apt_id: int) -> List[Dict]:
     async with db_pool.acquire() as conn:
         rows = await conn.fetch('''
             SELECT b.id, b.guest_name, b.checkin, b.checkout, b.hash,
-                   b.is_complete, b.current_status
+                   COALESCE(b.is_complete, FALSE) as is_complete, b.current_status
             FROM bookings b
             JOIN bookings_apartment_lnk bal ON b.id = bal.booking_id
-            WHERE bal.apartment_id = $1 AND b.is_complete = FALSE
+            WHERE bal.apartment_id = $1 AND COALESCE(b.is_complete, FALSE) = FALSE
             ORDER BY b.checkin DESC
         ''', apt_id)
         
@@ -822,7 +860,7 @@ async def get_booking_by_hash(hash_code: str) -> Optional[Dict]:
     """Получить бронирование по hash"""
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow('''
-            SELECT b.id, b.guest_name, b.checkin, b.is_complete,
+            SELECT b.id, b.guest_name, b.checkin, COALESCE(b.is_complete, FALSE) as is_complete,
                    a.id as apartment_id, a.name as apartment_name, a.address
             FROM bookings b
             JOIN bookings_apartment_lnk bal ON b.id = bal.booking_id
@@ -850,7 +888,9 @@ async def get_organization_managers(org_id: int) -> List[Dict]:
     """Получить менеджеров организации"""
     async with db_pool.acquire() as conn:
         rows = await conn.fetch('''
-            SELECT m.id, m.telegram_id, m.name, m.lastname, m.is_admin, m.is_owner
+            SELECT m.id, m.telegram_id, m.name, m.lastname, 
+                   COALESCE(m.is_admin, FALSE) as is_admin, 
+                   COALESCE(m.is_owner, FALSE) as is_owner
             FROM managers m
             JOIN managers_organization_lnk mol ON m.id = mol.manager_id
             WHERE mol.organization_id = $1
@@ -861,7 +901,7 @@ async def get_organization_managers(org_id: int) -> List[Dict]:
         for row in rows:
             result.append({
                 'telegram_id': row['telegram_id'],
-                'username': row['lastname'] or '',  # lastname используем как username
+                'username': row['lastname'] or '',
                 'first_name': row['name'] or 'Менеджер',
                 'is_admin': row['is_admin'] or row['is_owner']
             })
@@ -871,7 +911,6 @@ async def get_organization_managers(org_id: int) -> List[Dict]:
 async def get_bot_admins() -> List[int]:
     """Получить список telegram_id админов бота из admin_users (кроме id=1)"""
     async with db_pool.acquire() as conn:
-        # Пытаемся найти telegram_id в разных возможных полях
         rows = await conn.fetch('''
             SELECT 
                 CASE 
@@ -940,25 +979,33 @@ def get_useful_sections_keyboard():
 
 def get_organization_cabinet_keyboard(org_info: Dict):
     long_term_text = "Да" if org_info.get('is_long') else "Нет"
-    timezone_text = org_info.get('timezone', 'UTC+3')
+    timezone_text = safe_str(org_info.get('timezone'), 'UTC+3')
+    checkin_time = safe_str(org_info.get('check_in'), '14:00')
+    checkout_time = safe_str(org_info.get('check_out'), '12:00')
     
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Изменить название", callback_data="edit_org_name")],
         [InlineKeyboardButton(text="Изменить город", callback_data="edit_org_city")],
         [InlineKeyboardButton(text="Изменить приветствие", callback_data="edit_org_greeting")],
         [InlineKeyboardButton(text=f"Часовой пояс: {timezone_text}", callback_data="edit_org_timezone")],
-        [InlineKeyboardButton(text=f"Время заезда {org_info.get('check_in', '14:00')}", callback_data="edit_checkin_time")],
+        [InlineKeyboardButton(text=f"Время заезда {checkin_time}", callback_data="edit_checkin_time")],
         [InlineKeyboardButton(text=f"Только долгосрок: {long_term_text}", callback_data="toggle_long_term")],
-        [InlineKeyboardButton(text=f"Время выезда {org_info.get('check_out', '12:00')}", callback_data="edit_checkout_time")],
+        [InlineKeyboardButton(text=f"Время выезда {checkout_time}", callback_data="edit_checkout_time")],
         [InlineKeyboardButton(text="Пригласить менеджера", callback_data="invite_manager")],
         [InlineKeyboardButton(text="Менеджеры", callback_data="managers_list")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
     ])
 
 def get_apartments_list_keyboard(apartments: List[Tuple]):
+    """
+    ИСПРАВЛЕНО: используем safe_str() для безопасной обработки NULL значений.
+    Это предотвращает ошибку "InlineKeyboardButton text=None"
+    """
     buttons = []
     for apt_id, name, address, is_long in apartments:
-        buttons.append([InlineKeyboardButton(text=name, callback_data=f"apartment_{apt_id}")])
+        # Безопасно обрабатываем name - если NULL, используем "Объект #{id}"
+        button_text = safe_str(name, f'Объект #{apt_id}')
+        buttons.append([InlineKeyboardButton(text=button_text, callback_data=f"apartment_{apt_id}")])
     
     buttons.append([InlineKeyboardButton(text="➕ Добавить объект", callback_data="add_apartment")])
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")])
@@ -983,10 +1030,14 @@ def get_apartment_menu_keyboard(apt_id: int, is_long: bool = False):
     ])
 
 async def get_checkin_section_keyboard_async(apt_id: int, filled_fields: set = None):
-    """Клавиатура раздела Заселение с кастомными кнопками"""
+    """
+    Клавиатура раздела Заселение с кастомными кнопками.
+    НОВОЕ: добавлен индикатор заполненности ■
+    """
     filled_fields = filled_fields or set()
     
     def field_text(name: str, key: str) -> str:
+        """Добавляет ■ если поле заполнено"""
         return f"{name} ■" if key in filled_fields else name
     
     buttons = [
@@ -1004,19 +1055,17 @@ async def get_checkin_section_keyboard_async(apt_id: int, filled_fields: set = N
         [InlineKeyboardButton(text=field_text("📢 Правила", "rules"), callback_data=f"field_rules_{apt_id}")],
     ]
     
-    # Добавляем кастомные кнопки для раздела "Заселение"
+    # Добавляем кастомные кнопки
     custom_fields = await get_section_fields(apt_id, 'checkin')
     for field in custom_fields:
         if field['field_key'].startswith('custom_'):
             field_name = field['field_name']
             field_key = field['field_key']
             
-            # Ограничиваем длину callback_data
             safe_field_key = field_key[:30] if len(field_key) > 30 else field_key
             callback_data = f"custom_field_{apt_id}_checkin_{safe_field_key}"
             
             if len(callback_data.encode('utf-8')) > 64:
-                import hashlib
                 field_hash = hashlib.md5(field_key.encode()).hexdigest()[:8]
                 callback_data = f"cust_f_{apt_id}_checkin_{field_hash}"
             
@@ -1028,7 +1077,7 @@ async def get_checkin_section_keyboard_async(apt_id: int, filled_fields: set = N
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 async def get_rent_section_keyboard(apt_id: int, filled_fields: set = None):
-    """Клавиатура раздела Аренда с кастомными кнопками"""
+    """Клавиатура раздела Аренда с индикаторами заполненности"""
     filled_fields = filled_fields or set()
     
     def field_text(name: str, key: str) -> str:
@@ -1054,7 +1103,6 @@ async def get_rent_section_keyboard(apt_id: int, filled_fields: set = None):
             callback_data = f"custom_field_{apt_id}_rent_{safe_field_key}"
             
             if len(callback_data.encode('utf-8')) > 64:
-                import hashlib
                 field_hash = hashlib.md5(field_key.encode()).hexdigest()[:8]
                 callback_data = f"cust_f_{apt_id}_rent_{field_hash}"
             
@@ -1066,7 +1114,7 @@ async def get_rent_section_keyboard(apt_id: int, filled_fields: set = None):
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 async def get_help_subsection_keyboard(apt_id: int, filled_fields: set = None):
-    """Клавиатура подраздела Помощь с кастомными кнопками"""
+    """Клавиатура подраздела Помощь с индикаторами заполненности"""
     filled_fields = filled_fields or set()
     
     def field_text(name: str, key: str) -> str:
@@ -1091,7 +1139,6 @@ async def get_help_subsection_keyboard(apt_id: int, filled_fields: set = None):
             callback_data = f"custom_field_{apt_id}_help_{safe_field_key}"
             
             if len(callback_data.encode('utf-8')) > 64:
-                import hashlib
                 field_hash = hashlib.md5(field_key.encode()).hexdigest()[:8]
                 callback_data = f"cust_f_{apt_id}_help_{field_hash}"
             
@@ -1103,7 +1150,7 @@ async def get_help_subsection_keyboard(apt_id: int, filled_fields: set = None):
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 async def get_stores_subsection_keyboard(apt_id: int, filled_fields: set = None):
-    """Клавиатура подраздела Магазины с кастомными кнопками"""
+    """Клавиатура подраздела Магазины с индикаторами заполненности"""
     filled_fields = filled_fields or set()
     
     def field_text(name: str, key: str) -> str:
@@ -1127,7 +1174,6 @@ async def get_stores_subsection_keyboard(apt_id: int, filled_fields: set = None)
             callback_data = f"custom_field_{apt_id}_stores_{safe_field_key}"
             
             if len(callback_data.encode('utf-8')) > 64:
-                import hashlib
                 field_hash = hashlib.md5(field_key.encode()).hexdigest()[:8]
                 callback_data = f"cust_f_{apt_id}_stores_{field_hash}"
             
@@ -1139,7 +1185,7 @@ async def get_stores_subsection_keyboard(apt_id: int, filled_fields: set = None)
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 async def get_experiences_section_keyboard(apt_id: int, filled_fields: set = None):
-    """Клавиатура раздела Впечатления с кастомными кнопками"""
+    """Клавиатура раздела Впечатления с индикаторами заполненности"""
     filled_fields = filled_fields or set()
     
     def field_text(name: str, key: str) -> str:
@@ -1163,7 +1209,6 @@ async def get_experiences_section_keyboard(apt_id: int, filled_fields: set = Non
             callback_data = f"custom_field_{apt_id}_experiences_{safe_field_key}"
             
             if len(callback_data.encode('utf-8')) > 64:
-                import hashlib
                 field_hash = hashlib.md5(field_key.encode()).hexdigest()[:8]
                 callback_data = f"cust_f_{apt_id}_exp_{field_hash}"
             
@@ -1175,7 +1220,7 @@ async def get_experiences_section_keyboard(apt_id: int, filled_fields: set = Non
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 async def get_checkout_section_keyboard(apt_id: int, filled_fields: set = None):
-    """Клавиатура раздела Выселение с кастомными кнопками"""
+    """Клавиатура раздела Выселение с индикаторами заполненности"""
     filled_fields = filled_fields or set()
     
     def field_text(name: str, key: str) -> str:
@@ -1199,7 +1244,6 @@ async def get_checkout_section_keyboard(apt_id: int, filled_fields: set = None):
             callback_data = f"custom_field_{apt_id}_checkout_{safe_field_key}"
             
             if len(callback_data.encode('utf-8')) > 64:
-                import hashlib
                 field_hash = hashlib.md5(field_key.encode()).hexdigest()[:8]
                 callback_data = f"cust_f_{apt_id}_checkout_{field_hash}"
             
@@ -1236,8 +1280,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
         
         if booking and not booking['is_complete']:
             apt_id = booking['apartment_id']
-            apt_name = booking['apartment_name']
-            address = booking['address'] or "Москва"
+            apt_name = safe_str(booking['apartment_name'], 'Объект')
+            address = safe_str(booking['address'], 'Адрес не указан')
             
             text = f"{apt_name}\n\nАдрес: {address}.\n\nИнформация для изучения:"
             
@@ -1260,7 +1304,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
         if org_id:
             await state.update_data(current_organization_id=org_id)
             org_info = await get_organization_info(org_id)
-            await message.answer(f"✅ Присоединились к «{org_info['name']}»!")
+            org_name = safe_str(org_info.get('name'), 'Организация')
+            await message.answer(f"✅ Присоединились к «{org_name}»!")
             
             await message.answer(
                 "Главное меню бота 🏠",
@@ -1447,11 +1492,11 @@ async def organization_cabinet(callback: types.CallbackQuery, state: FSMContext)
     org_info = await get_organization_info(org_id)
     
     if org_info:
-        text = (
-            f"{org_info['name']}\n"
-            f"{org_info['city']}\n\n"
-            f"Приветствие:\n{org_info.get('greeting', '')}"
-        )
+        org_name = safe_str(org_info.get('name'), 'Организация')
+        org_city = safe_str(org_info.get('city'), 'Город не указан')
+        greeting = safe_str(org_info.get('greeting'), 'Приветствие не задано')
+        
+        text = f"{org_name}\n{org_city}\n\nПриветствие:\n{greeting}"
         await callback.message.edit_text(text, reply_markup=get_organization_cabinet_keyboard(org_info))
     
     await callback.answer()
@@ -1463,7 +1508,8 @@ async def invite_manager(callback: types.CallbackQuery, state: FSMContext):
     
     org_info = await get_organization_info(org_id)
     bot_username = (await bot.get_me()).username
-    invite_link = f"https://t.me/{bot_username}?start=org_{org_info['hash']}"
+    hash_code = safe_str(org_info.get('hash'), 'hash')
+    invite_link = f"https://t.me/{bot_username}?start=org_{hash_code}"
     
     text = f"Ссылка для приглашения:\n\n{invite_link}"
     
@@ -1485,8 +1531,8 @@ async def managers_list(callback: types.CallbackQuery, state: FSMContext):
     
     if managers:
         for manager in managers:
-            username = manager['username'] or "Без username"
-            first_name = manager['first_name']
+            username = safe_str(manager['username'], "Без username")
+            first_name = safe_str(manager['first_name'], "Менеджер")
             role = "👑 Админ" if manager['is_admin'] else "👤 Менеджер"
             text += f"• {role} - {first_name} (@{username})\n"
     else:
@@ -1583,6 +1629,9 @@ async def process_apartment_address(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("confirm_save_"))
 async def confirm_save(callback: types.CallbackQuery, state: FSMContext):
+    """
+    ДОБАВЛЕНО: уведомление о сохранении
+    """
     data = await state.get_data()
     org_id = data.get('current_organization_id')
     
@@ -1593,7 +1642,8 @@ async def confirm_save(callback: types.CallbackQuery, state: FSMContext):
         "Список ваших объектов:",
         reply_markup=get_apartments_list_keyboard(apartments)
     )
-    await callback.answer("Объект сохранен!")
+    # НОВОЕ: уведомление
+    await callback.answer("✅ Объект сохранен!")
 
 @dp.callback_query(F.data == "skip_address")
 async def skip_address(callback: types.CallbackQuery, state: FSMContext):
@@ -1631,8 +1681,8 @@ async def view_apartment(callback: types.CallbackQuery):
     apt_info = await get_apartment_info(apt_id)
     
     if apt_info:
-        apt_name = apt_info['name']
-        is_long = apt_info['is_long']
+        apt_name = safe_str(apt_info.get('name'), f'Объект #{apt_id}')
+        is_long = apt_info.get('is_long', False)
         
         text = f"Объект: {apt_name}"
         await callback.message.edit_text(text, reply_markup=get_apartment_menu_keyboard(apt_id, is_long))
@@ -1645,8 +1695,8 @@ async def toggle_term_handler(callback: types.CallbackQuery):
     await toggle_apartment_term(apt_id)
     
     apt_info = await get_apartment_info(apt_id)
-    apt_name = apt_info['name']
-    is_long = apt_info['is_long']
+    apt_name = safe_str(apt_info.get('name'), f'Объект #{apt_id}')
+    is_long = apt_info.get('is_long', False)
     
     mode_text = "долгосрочная аренда" if is_long else "краткосрочная аренда"
     
@@ -1689,10 +1739,12 @@ async def delete_apartment_confirmed(callback: types.CallbackQuery, state: FSMCo
 async def section_checkin(callback: types.CallbackQuery):
     apt_id = int(callback.data.split("_")[2])
     
+    # НОВОЕ: получаем заполненные поля для индикаторов
     filled_checkin = await get_filled_fields(apt_id, 'checkin')
     filled_help = await get_filled_fields(apt_id, 'help')
     filled_stores = await get_filled_fields(apt_id, 'stores')
     
+    # Объединяем все заполненные поля для подразделов
     all_filled = filled_checkin | filled_help | filled_stores
     
     keyboard = await get_checkin_section_keyboard_async(apt_id, all_filled)
@@ -1725,19 +1777,6 @@ async def subsection_help(callback: types.CallbackQuery):
     )
     await callback.answer()
 
-# Редирект для старых кнопок (section_help вместо subsection_help)
-@dp.callback_query(F.data.startswith("section_help_"))
-async def section_help_redirect(callback: types.CallbackQuery):
-    apt_id = int(callback.data.split("_")[2])
-    # Перенаправляем на правильный обработчик
-    filled_fields = await get_filled_fields(apt_id, 'help')
-    
-    await callback.message.edit_text(
-        "Подраздел 🏠 Помощь",
-        reply_markup=await get_help_subsection_keyboard(apt_id, filled_fields)
-    )
-    await callback.answer("Обновлено")
-
 @dp.callback_query(F.data.startswith("subsection_stores_"))
 async def subsection_stores(callback: types.CallbackQuery):
     apt_id = int(callback.data.split("_")[2])
@@ -1748,19 +1787,6 @@ async def subsection_stores(callback: types.CallbackQuery):
         reply_markup=await get_stores_subsection_keyboard(apt_id, filled_fields)
     )
     await callback.answer()
-
-# Редирект для старых кнопок (section_stores вместо subsection_stores)
-@dp.callback_query(F.data.startswith("section_stores_"))
-async def section_stores_redirect(callback: types.CallbackQuery):
-    apt_id = int(callback.data.split("_")[2])
-    # Перенаправляем на правильный обработчик
-    filled_fields = await get_filled_fields(apt_id, 'stores')
-    
-    await callback.message.edit_text(
-        "Подраздел 📍 Магазины",
-        reply_markup=await get_stores_subsection_keyboard(apt_id, filled_fields)
-    )
-    await callback.answer("Обновлено")
 
 @dp.callback_query(F.data.startswith("section_experiences_"))
 async def section_experiences(callback: types.CallbackQuery):
@@ -1826,6 +1852,9 @@ async def edit_field(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(ApartmentStates.editing_field)
 async def process_field_content(message: types.Message, state: FSMContext):
+    """
+    ДОБАВЛЕНО: уведомление о сохранении
+    """
     data = await state.get_data()
     apt_id = data.get('editing_apartment_id')
     field_key = data.get('editing_field_key')
@@ -1858,8 +1887,10 @@ async def process_field_content(message: types.Message, state: FSMContext):
     
     await save_apartment_field(apt_id, section, field_key, field_name, text_content, file_id, file_type)
     
+    # Получаем обновленные заполненные поля
     filled_fields = await get_filled_fields(apt_id, section)
     
+    # Определяем правильную клавиатуру
     if section == "help":
         keyboard = await get_help_subsection_keyboard(apt_id, filled_fields)
         text = "Подраздел 🏠 Помощь"
@@ -1876,6 +1907,7 @@ async def process_field_content(message: types.Message, state: FSMContext):
         keyboard = await get_checkout_section_keyboard(apt_id, filled_fields)
         text = "Раздел 📦 Выселение"
     else:
+        # Для checkin нужно получить filled из всех подразделов
         filled_checkin = await get_filled_fields(apt_id, 'checkin')
         filled_help = await get_filled_fields(apt_id, 'help')
         filled_stores = await get_filled_fields(apt_id, 'stores')
@@ -1884,6 +1916,8 @@ async def process_field_content(message: types.Message, state: FSMContext):
         keyboard = await get_checkin_section_keyboard_async(apt_id, all_filled)
         text = "Раздел 🧳 Заселение"
     
+    # НОВОЕ: уведомление о сохранении
+    await message.answer("✅ Информация сохранена!")
     await message.answer(text, reply_markup=keyboard)
     await state.clear()
 
@@ -1893,6 +1927,7 @@ async def skip_field(callback: types.CallbackQuery, state: FSMContext):
     section = parts[2]
     apt_id = int(parts[3])
     
+    # Определяем клавиатуру
     if section == "help":
         filled_fields = await get_filled_fields(apt_id, 'help')
         keyboard = await get_help_subsection_keyboard(apt_id, filled_fields)
@@ -1941,17 +1976,19 @@ async def edit_org_name(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(OrganizationStates.editing_name)
 async def process_edit_org_name(message: types.Message, state: FSMContext):
+    """ДОБАВЛЕНО: уведомление о сохранении"""
     data = await state.get_data()
     org_id = data.get('current_organization_id')
     
     await update_organization_field(org_id, 'name', message.text)
     
     org_info = await get_organization_info(org_id)
-    text = (
-        f"{org_info['name']}\n"
-        f"{org_info['city']}\n\n"
-        f"Приветствие:\n{org_info.get('greeting', '')}"
-    )
+    org_name = safe_str(org_info.get('name'), 'Организация')
+    org_city = safe_str(org_info.get('city'), 'Город не указан')
+    greeting = safe_str(org_info.get('greeting'), '')
+    
+    text = f"{org_name}\n{org_city}\n\nПриветствие:\n{greeting}"
+    await message.answer("✅ Информация сохранена!")
     await message.answer(text, reply_markup=get_organization_cabinet_keyboard(org_info))
     await state.set_data({'current_organization_id': org_id})
 
@@ -1966,17 +2003,19 @@ async def edit_org_city(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(OrganizationStates.editing_city)
 async def process_edit_org_city(message: types.Message, state: FSMContext):
+    """ДОБАВЛЕНО: уведомление о сохранении"""
     data = await state.get_data()
     org_id = data.get('current_organization_id')
     
     await update_organization_field(org_id, 'city', message.text)
     
     org_info = await get_organization_info(org_id)
-    text = (
-        f"{org_info['name']}\n"
-        f"{org_info['city']}\n\n"
-        f"Приветствие:\n{org_info.get('greeting', '')}"
-    )
+    org_name = safe_str(org_info.get('name'), 'Организация')
+    org_city = safe_str(org_info.get('city'), 'Город не указан')
+    greeting = safe_str(org_info.get('greeting'), '')
+    
+    text = f"{org_name}\n{org_city}\n\nПриветствие:\n{greeting}"
+    await message.answer("✅ Информация сохранена!")
     await message.answer(text, reply_markup=get_organization_cabinet_keyboard(org_info))
     await clear_state_keep_company(state)
 
@@ -1994,17 +2033,19 @@ async def edit_org_greeting(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(OrganizationStates.editing_greeting)
 async def process_edit_org_greeting(message: types.Message, state: FSMContext):
+    """ДОБАВЛЕНО: уведомление о сохранении"""
     data = await state.get_data()
     org_id = data.get('current_organization_id')
     
     await update_organization_field(org_id, 'greeting', message.text)
     
     org_info = await get_organization_info(org_id)
-    text = (
-        f"{org_info['name']}\n"
-        f"{org_info['city']}\n\n"
-        f"Приветствие:\n{org_info.get('greeting', '')}"
-    )
+    org_name = safe_str(org_info.get('name'), 'Организация')
+    org_city = safe_str(org_info.get('city'), 'Город не указан')
+    greeting = safe_str(org_info.get('greeting'), '')
+    
+    text = f"{org_name}\n{org_city}\n\nПриветствие:\n{greeting}"
+    await message.answer("✅ Информация сохранена!")
     await message.answer(text, reply_markup=get_organization_cabinet_keyboard(org_info))
     await clear_state_keep_company(state)
 
@@ -2019,17 +2060,19 @@ async def edit_org_timezone(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(OrganizationStates.waiting_timezone)
 async def process_edit_timezone(message: types.Message, state: FSMContext):
+    """ДОБАВЛЕНО: уведомление о сохранении"""
     data = await state.get_data()
     org_id = data.get('current_organization_id')
     
     await update_organization_field(org_id, 'timezone', message.text)
     
     org_info = await get_organization_info(org_id)
-    text = (
-        f"{org_info['name']}\n"
-        f"{org_info['city']}\n\n"
-        f"Приветствие:\n{org_info.get('greeting', '')}"
-    )
+    org_name = safe_str(org_info.get('name'), 'Организация')
+    org_city = safe_str(org_info.get('city'), 'Город не указан')
+    greeting = safe_str(org_info.get('greeting'), '')
+    
+    text = f"{org_name}\n{org_city}\n\nПриветствие:\n{greeting}"
+    await message.answer("✅ Информация сохранена!")
     await message.answer(text, reply_markup=get_organization_cabinet_keyboard(org_info))
     await clear_state_keep_company(state)
 
@@ -2044,17 +2087,19 @@ async def edit_checkin_time(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(OrganizationStates.waiting_checkin_time)
 async def process_edit_checkin_time(message: types.Message, state: FSMContext):
+    """ДОБАВЛЕНО: уведомление о сохранении"""
     data = await state.get_data()
     org_id = data.get('current_organization_id')
     
     await update_organization_field(org_id, 'check_in', message.text)
     
     org_info = await get_organization_info(org_id)
-    text = (
-        f"{org_info['name']}\n"
-        f"{org_info['city']}\n\n"
-        f"Приветствие:\n{org_info.get('greeting', '')}"
-    )
+    org_name = safe_str(org_info.get('name'), 'Организация')
+    org_city = safe_str(org_info.get('city'), 'Город не указан')
+    greeting = safe_str(org_info.get('greeting'), '')
+    
+    text = f"{org_name}\n{org_city}\n\nПриветствие:\n{greeting}"
+    await message.answer("✅ Информация сохранена!")
     await message.answer(text, reply_markup=get_organization_cabinet_keyboard(org_info))
     await clear_state_keep_company(state)
 
@@ -2069,40 +2114,43 @@ async def edit_checkout_time(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(OrganizationStates.waiting_checkout_time)
 async def process_edit_checkout_time(message: types.Message, state: FSMContext):
+    """ДОБАВЛЕНО: уведомление о сохранении"""
     data = await state.get_data()
     org_id = data.get('current_organization_id')
     
     await update_organization_field(org_id, 'check_out', message.text)
     
     org_info = await get_organization_info(org_id)
-    text = (
-        f"{org_info['name']}\n"
-        f"{org_info['city']}\n\n"
-        f"Приветствие:\n{org_info.get('greeting', '')}"
-    )
+    org_name = safe_str(org_info.get('name'), 'Организация')
+    org_city = safe_str(org_info.get('city'), 'Город не указан')
+    greeting = safe_str(org_info.get('greeting'), '')
+    
+    text = f"{org_name}\n{org_city}\n\nПриветствие:\n{greeting}"
+    await message.answer("✅ Информация сохранена!")
     await message.answer(text, reply_markup=get_organization_cabinet_keyboard(org_info))
     await clear_state_keep_company(state)
 
 @dp.callback_query(F.data == "toggle_long_term")
 async def toggle_long_term(callback: types.CallbackQuery, state: FSMContext):
+    """ДОБАВЛЕНО: уведомление о сохранении"""
     data = await state.get_data()
     org_id = data.get('current_organization_id')
     
     async with db_pool.acquire() as conn:
         await conn.execute('''
             UPDATE organizations 
-            SET is_long = NOT is_long, updated_at = NOW()
+            SET is_long = NOT COALESCE(is_long, FALSE), updated_at = NOW()
             WHERE id = $1
         ''', org_id)
     
     org_info = await get_organization_info(org_id)
-    text = (
-        f"{org_info['name']}\n"
-        f"{org_info['city']}\n\n"
-        f"Приветствие:\n{org_info.get('greeting', '')}"
-    )
+    org_name = safe_str(org_info.get('name'), 'Организация')
+    org_city = safe_str(org_info.get('city'), 'Город не указан')
+    greeting = safe_str(org_info.get('greeting'), '')
+    
+    text = f"{org_name}\n{org_city}\n\nПриветствие:\n{greeting}"
     await callback.message.edit_text(text, reply_markup=get_organization_cabinet_keyboard(org_info))
-    await callback.answer()
+    await callback.answer("✅ Информация сохранена!")
 
 # ============================================
 # РЕДАКТИРОВАНИЕ ОБЪЕКТОВ
@@ -2118,8 +2166,8 @@ async def edit_apartment_info(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("Объект не найден", show_alert=True)
         return
     
-    apt_name = apt_info['name']
-    apt_address = apt_info['address'] or "Не указан"
+    apt_name = safe_str(apt_info.get('name'), f'Объект #{apt_id}')
+    apt_address = safe_str(apt_info.get('address'), "Не указан")
     
     text = f"Редактирование объекта\n\n📝 Название: {apt_name}\n📍 Адрес: {apt_address}"
     
@@ -2202,6 +2250,7 @@ async def process_edit_apartment_address(message: types.Message, state: FSMConte
 
 @dp.callback_query(F.data.startswith("confirm_apt_edit_"))
 async def confirm_apartment_edit(callback: types.CallbackQuery, state: FSMContext):
+    """ДОБАВЛЕНО: уведомление о сохранении"""
     apt_id = int(callback.data.split("_")[3])
     data = await state.get_data()
     
@@ -2228,12 +2277,12 @@ async def confirm_apartment_edit(callback: types.CallbackQuery, state: FSMContex
     await clear_state_keep_company(state)
     
     apt_info = await get_apartment_info(apt_id)
-    apt_name = apt_info['name']
-    is_long = apt_info['is_long']
+    apt_name = safe_str(apt_info.get('name'), f'Объект #{apt_id}')
+    is_long = apt_info.get('is_long', False)
     
     text = f"Объект: {apt_name}"
     await callback.message.edit_text(text, reply_markup=get_apartment_menu_keyboard(apt_id, is_long))
-    await callback.answer("✅ Изменения сохранены!")
+    await callback.answer("✅ Информация сохранена!")
 
 # ============================================
 # КАСТОМНЫЕ КНОПКИ
@@ -2385,6 +2434,7 @@ async def process_custom_button_content(message: types.Message, state: FSMContex
 
 @dp.callback_query(F.data.startswith("save_custom_"))
 async def save_custom_field(callback: types.CallbackQuery, state: FSMContext):
+    """ДОБАВЛЕНО: уведомление о сохранении"""
     parts = callback.data.split("_")
     section = parts[2]
     apt_id = int(parts[3])
@@ -2456,6 +2506,7 @@ async def save_custom_field(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("delete_custom_"))
 async def delete_custom_field_handler(callback: types.CallbackQuery):
+    """ДОБАВЛЕНО: уведомление об удалении"""
     parts = callback.data.split("_")
     apt_id = int(parts[2])
     section = parts[3]
@@ -2535,7 +2586,6 @@ async def view_custom_field(callback: types.CallbackQuery):
 async def view_custom_field_short(callback: types.CallbackQuery):
     """Обработчик для кастомных полей с хешированными callback"""
     parts = callback.data.split("_")
-    # cust_f_{apt_id}_{section}_{hash}
     apt_id = int(parts[2])
     section = parts[3]
     field_hash = parts[4]
@@ -2543,7 +2593,6 @@ async def view_custom_field_short(callback: types.CallbackQuery):
     # Находим поле по хешу
     custom_fields = await get_section_fields(apt_id, section)
     
-    import hashlib
     field_key = None
     for field in custom_fields:
         if field['field_key'].startswith('custom_'):
@@ -2555,7 +2604,6 @@ async def view_custom_field_short(callback: types.CallbackQuery):
         await callback.answer("Кнопка не найдена", show_alert=True)
         return
     
-    # Получаем info_id из field_key
     info_id = int(field_key.split('_')[1])
     
     async with db_pool.acquire() as conn:
@@ -2636,8 +2684,8 @@ async def bookings_menu(callback: types.CallbackQuery):
     buttons = []
     
     for booking in bookings:
-        guest_name = booking['guest_name']
-        checkin = booking['checkin'].strftime('%d.%m.%y')
+        guest_name = safe_str(booking['guest_name'], 'Гость')
+        checkin = booking['checkin'].strftime('%d.%m.%y') if booking.get('checkin') else 'Дата не указана'
         icon = "🔴" if not booking['is_complete'] else "⚪"
         buttons.append([InlineKeyboardButton(
             text=f"{guest_name} — {checkin} {icon}",
@@ -2717,8 +2765,8 @@ async def process_checkin_date(message: types.Message, state: FSMContext):
         
         buttons = []
         for booking in bookings:
-            b_guest_name = booking['guest_name']
-            b_checkin = booking['checkin'].strftime('%d.%m.%y')
+            b_guest_name = safe_str(booking['guest_name'], 'Гость')
+            b_checkin = booking['checkin'].strftime('%d.%m.%y') if booking.get('checkin') else 'Дата не указана'
             icon = "🔴" if not booking['is_complete'] else "⚪"
             buttons.append([InlineKeyboardButton(
                 text=f"{b_guest_name} — {b_checkin} {icon}",
@@ -2754,13 +2802,15 @@ async def view_booking(callback: types.CallbackQuery):
         return
     
     apt_id = booking['apartment_id']
+    guest_name = safe_str(booking['guest_name'], 'Гость')
+    checkin = booking['checkin'].strftime('%d.%m.%y') if booking.get('checkin') else 'Дата не указана'
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Завершить", callback_data=f"complete_booking_{booking_id}_{apt_id}")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"bookings_{apt_id}")]
     ])
     
-    text = f"Бронирование:\n\nГость: {booking['guest_name']}\nДата заезда: {booking['checkin']}"
+    text = f"Бронирование:\n\nГость: {guest_name}\nДата заезда: {checkin}"
     
     await callback.message.edit_text(text, reply_markup=keyboard)
     await callback.answer()
@@ -2780,8 +2830,8 @@ async def complete_booking_handler(callback: types.CallbackQuery):
         
         buttons = []
         for booking in bookings:
-            guest_name = booking['guest_name']
-            checkin = booking['checkin'].strftime('%d.%m.%y')
+            guest_name = safe_str(booking['guest_name'], 'Гость')
+            checkin = booking['checkin'].strftime('%d.%m.%y') if booking.get('checkin') else 'Дата не указана'
             icon = "🔴" if not booking['is_complete'] else "⚪"
             buttons.append([InlineKeyboardButton(
                 text=f"{guest_name} — {checkin} {icon}",
@@ -2803,7 +2853,7 @@ async def generate_owner_link(callback: types.CallbackQuery):
     apt_id = int(callback.data.split("_")[2])
     
     apt_info = await get_apartment_info(apt_id)
-    apt_name = apt_info['name']
+    apt_name = safe_str(apt_info.get('name'), f'Объект #{apt_id}')
     
     bot_username = (await bot.get_me()).username
     owner_link = f"https://t.me/{bot_username}?start=owner_{apt_id}"
@@ -2828,8 +2878,8 @@ async def preview_apartment(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(preview_mode=True, preview_apartment_id=apt_id)
     
     apt_info = await get_apartment_info(apt_id)
-    apt_name = apt_info['name']
-    address = apt_info['address'] or "Москва"
+    apt_name = safe_str(apt_info.get('name'), f'Объект #{apt_id}')
+    address = safe_str(apt_info.get('address'), "Адрес не указан")
     
     text = f"{apt_name}\n\nАдрес: {address}.\n\nИнформация для изучения:"
     
@@ -2848,10 +2898,9 @@ async def preview_start(callback: types.CallbackQuery):
     apt_id = int(callback.data.split("_")[2])
     
     apt_info = await get_apartment_info(apt_id)
-    apt_name = apt_info['name']
+    apt_name = safe_str(apt_info.get('name'), f'Объект #{apt_id}')
     
     async with db_pool.acquire() as conn:
-        # ИСПРАВЛЕН: получаем родительские категории
         sections_data = await conn.fetch('''
             SELECT DISTINCT COALESCE(parent_cat.name, child_cat.name) as section_name
             FROM infos i
@@ -2904,13 +2953,10 @@ async def preview_section(callback: types.CallbackQuery):
         field_name = field['field_name']
         field_key = field['field_key']
         
-        # Ограничиваем длину callback_data (Telegram лимит 64 байта)
         safe_field_key = field_key[:30] if len(field_key) > 30 else field_key
         callback_data = f"prevw_field_{apt_id}_{section}_{safe_field_key}"
         
-        # Проверяем длину callback_data
         if len(callback_data.encode('utf-8')) > 64:
-            import hashlib
             field_hash = hashlib.md5(field_key.encode()).hexdigest()[:8]
             callback_data = f"prevw_f_{apt_id}_{section}_{field_hash}"
         
@@ -2933,7 +2979,7 @@ async def preview_section(callback: types.CallbackQuery):
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     
-    # Проверяем тип сообщения - если это фото/видео, удаляем и создаем новое
+    # Проверяем тип сообщения
     if callback.message.photo or callback.message.video or callback.message.document:
         try:
             await callback.message.delete()
@@ -2966,7 +3012,6 @@ async def preview_subsection_help(callback: types.CallbackQuery):
         callback_data = f"prevw_field_{apt_id}_help_{safe_field_key}"
         
         if len(callback_data.encode('utf-8')) > 64:
-            import hashlib
             field_hash = hashlib.md5(field_key.encode()).hexdigest()[:8]
             callback_data = f"prevw_f_{apt_id}_help_{field_hash}"
         
@@ -3000,7 +3045,6 @@ async def preview_subsection_stores(callback: types.CallbackQuery):
         callback_data = f"prevw_field_{apt_id}_stores_{safe_field_key}"
         
         if len(callback_data.encode('utf-8')) > 64:
-            import hashlib
             field_hash = hashlib.md5(field_key.encode()).hexdigest()[:8]
             callback_data = f"prevw_f_{apt_id}_stores_{field_hash}"
         
@@ -3017,21 +3061,16 @@ async def preview_subsection_stores(callback: types.CallbackQuery):
 async def preview_field(callback: types.CallbackQuery):
     parts = callback.data.split("_")
     
-    # Поддержка обоих форматов: prevw_field и prevw_f (хешированный)
     if callback.data.startswith("prevw_f_"):
-        # Формат: prevw_f_{apt_id}_{section}_{hash}
         apt_id = int(parts[2])
         section = parts[3]
         field_hash = parts[4]
         
-        # Находим поле по хешу (пока просто берём первое)
         fields = await get_section_fields(apt_id, section)
         if not fields:
             await callback.answer("Нет данных", show_alert=True)
             return
         
-        # Ищем поле по хешу
-        import hashlib
         field_key = None
         for f in fields:
             if hashlib.md5(f['field_key'].encode()).hexdigest()[:8] == field_hash:
@@ -3039,9 +3078,8 @@ async def preview_field(callback: types.CallbackQuery):
                 break
         
         if not field_key:
-            field_key = fields[0]['field_key']  # Fallback
+            field_key = fields[0]['field_key']
     else:
-        # Формат: prevw_field_{apt_id}_{section}_{field_key}
         apt_id = int(parts[2])
         section = parts[3]
         field_key = "_".join(parts[4:])
@@ -3052,10 +3090,8 @@ async def preview_field(callback: types.CallbackQuery):
         await callback.answer("Нет данных", show_alert=True)
         return
     
-    # Получаем красивое название из FIELD_NAMES или используем название из БД
     field_name = FIELD_NAMES.get(field_key)
     if not field_name:
-        # Если не нашли в маппинге - берём из БД
         fields = await get_section_fields(apt_id, section)
         for f in fields:
             if f['field_key'] == field_key:
@@ -3078,7 +3114,6 @@ async def preview_field(callback: types.CallbackQuery):
         try:
             caption = f"{header}\n\n{text_content}" if text_content else header
             
-            # Удаляем старое сообщение и отправляем новое с медиа
             await callback.message.delete()
             
             if file_type == "photo":
@@ -3093,7 +3128,6 @@ async def preview_field(callback: types.CallbackQuery):
             
         except Exception as e:
             logger.error(f"Error sending media: {e}")
-            # Fallback к текстовому сообщению
             full_text = f"{header}\n\n{text_content}" if text_content else header
             try:
                 await callback.message.delete()
@@ -3103,7 +3137,6 @@ async def preview_field(callback: types.CallbackQuery):
             await callback.answer()
             return
     
-    # Только текст
     if text_content:
         full_text = f"{header}\n\n{text_content}"
     else:
@@ -3112,7 +3145,6 @@ async def preview_field(callback: types.CallbackQuery):
     try:
         await callback.message.edit_text(full_text, reply_markup=keyboard)
     except Exception as e:
-        # Если не можем отредактировать (например сообщение с фото) - отправляем новое
         await callback.message.delete()
         await callback.message.answer(full_text, reply_markup=keyboard)
     
@@ -3124,8 +3156,8 @@ async def exit_preview(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(preview_mode=False)
     
     apt_info = await get_apartment_info(apt_id)
-    apt_name = apt_info['name']
-    is_long = apt_info['is_long']
+    apt_name = safe_str(apt_info.get('name'), f'Объект #{apt_id}')
+    is_long = apt_info.get('is_long', False)
     
     text = f"Объект: {apt_name}"
     await callback.message.edit_text(text, reply_markup=get_apartment_menu_keyboard(apt_id, is_long))
@@ -3142,10 +3174,9 @@ async def guest_start(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(guest_mode=True, guest_apartment_id=apt_id)
     
     apt_info = await get_apartment_info(apt_id)
-    apt_name = apt_info['name']
+    apt_name = safe_str(apt_info.get('name'), f'Объект #{apt_id}')
     
     async with db_pool.acquire() as conn:
-        # ИСПРАВЛЕН: получаем родительские категории
         sections_data = await conn.fetch('''
             SELECT DISTINCT COALESCE(parent_cat.name, child_cat.name) as section_name
             FROM infos i
@@ -3201,12 +3232,10 @@ async def guest_view_section(callback: types.CallbackQuery):
         field_name = field['field_name']
         field_key = field['field_key']
         
-        # Ограничиваем длину callback_data
         safe_field_key = field_key[:30] if len(field_key) > 30 else field_key
         callback_data = f"guest_field_{apt_id}_{section}_{safe_field_key}"
         
         if len(callback_data.encode('utf-8')) > 64:
-            import hashlib
             field_hash = hashlib.md5(field_key.encode()).hexdigest()[:8]
             callback_data = f"guest_f_{apt_id}_{section}_{field_hash}"
         
@@ -3229,7 +3258,6 @@ async def guest_view_section(callback: types.CallbackQuery):
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     
-    # Проверяем тип сообщения - если это фото/видео, удаляем и создаем новое
     if callback.message.photo or callback.message.video or callback.message.document:
         try:
             await callback.message.delete()
@@ -3262,7 +3290,6 @@ async def guest_subsection_help(callback: types.CallbackQuery):
         callback_data = f"guest_field_{apt_id}_help_{safe_field_key}"
         
         if len(callback_data.encode('utf-8')) > 64:
-            import hashlib
             field_hash = hashlib.md5(field_key.encode()).hexdigest()[:8]
             callback_data = f"guest_f_{apt_id}_help_{field_hash}"
         
@@ -3296,7 +3323,6 @@ async def guest_subsection_stores(callback: types.CallbackQuery):
         callback_data = f"guest_field_{apt_id}_stores_{safe_field_key}"
         
         if len(callback_data.encode('utf-8')) > 64:
-            import hashlib
             field_hash = hashlib.md5(field_key.encode()).hexdigest()[:8]
             callback_data = f"guest_f_{apt_id}_stores_{field_hash}"
         
@@ -3313,7 +3339,6 @@ async def guest_subsection_stores(callback: types.CallbackQuery):
 async def guest_view_field(callback: types.CallbackQuery):
     parts = callback.data.split("_")
     
-    # Поддержка обоих форматов
     if callback.data.startswith("guest_f_"):
         apt_id = int(parts[2])
         section = parts[3]
@@ -3324,7 +3349,6 @@ async def guest_view_field(callback: types.CallbackQuery):
             await callback.answer("Нет данных", show_alert=True)
             return
         
-        import hashlib
         field_key = None
         for f in fields:
             if hashlib.md5(f['field_key'].encode()).hexdigest()[:8] == field_hash:
@@ -3344,7 +3368,6 @@ async def guest_view_field(callback: types.CallbackQuery):
         await callback.answer("Нет данных", show_alert=True)
         return
     
-    # Получаем красивое название
     field_name = FIELD_NAMES.get(field_key)
     if not field_name:
         fields = await get_section_fields(apt_id, section)
@@ -3463,23 +3486,21 @@ async def connect_shahmatka(callback: types.CallbackQuery, state: FSMContext):
             )
             return
     
-    # Получаем информацию об организации
     org_info = await get_organization_info(org_id)
     
     if not org_info:
         await callback.answer("⚠️ Организация не найдена", show_alert=True)
         return
     
-    # Используем hash как document_id
-    document_id = org_info['hash']
+    document_id = safe_str(org_info.get('hash'), 'hash')
     telegram_id = callback.from_user.id
+    org_name = safe_str(org_info.get('name'), 'Организация')
     
-    # Генерируем ссылку
     shahmatka_url = f"https://app.podelu.pro/register?telegram={telegram_id}&organization={document_id}"
     
     text = (
         f"♟️ Подключение шахматки\n\n"
-        f"📋 Компания: {org_info['name']}\n\n"
+        f"📋 Компания: {org_name}\n\n"
         f"🔗 Ваша персональная ссылка для регистрации:\n"
         f"{shahmatka_url}\n\n"
         f"📱 Нажмите кнопку ниже для подключения шахматки к вашей компании."
@@ -3515,11 +3536,9 @@ async def process_suggestion(message: types.Message, state: FSMContext):
         )
         return
     
-    # Сохраняем в лог
     user_info = f"{message.from_user.id} (@{message.from_user.username or 'no_username'})"
     logger.info(f"💡 Suggestion from {user_info}: {suggestion_text}")
     
-    # Отправляем админам
     admins = await get_bot_admins()
     
     if admins:
@@ -3574,11 +3593,11 @@ async def cmd_company(message: types.Message, state: FSMContext):
     org_info = await get_organization_info(org_id)
     
     if org_info:
-        text = (
-            f"{org_info['name']}\n"
-            f"{org_info['city']}\n\n"
-            f"Приветствие:\n{org_info.get('greeting', '')}"
-        )
+        org_name = safe_str(org_info.get('name'), 'Организация')
+        org_city = safe_str(org_info.get('city'), 'Город не указан')
+        greeting = safe_str(org_info.get('greeting'), '')
+        
+        text = f"{org_name}\n{org_city}\n\nПриветствие:\n{greeting}"
         await message.answer(text, reply_markup=get_organization_cabinet_keyboard(org_info))
     else:
         await message.answer(
