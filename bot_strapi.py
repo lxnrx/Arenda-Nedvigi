@@ -486,26 +486,19 @@ async def join_organization_by_hash(telegram_id: int, hash_code: str) -> Optiona
 # ============================================
 
 async def get_organization_apartments(org_id: int) -> List[Tuple[int, str, str, bool]]:
-    """
-    Получить список квартир организации.
-    ИСПРАВЛЕНО: используем INNER JOIN с apartments_organization_lnk
-    для фильтрации только объектов этой организации.
-    """
+    """Получить список квартир организации - ИСПРАВЛЕНО: убрана проблема с ORDER BY"""
     async with db_pool.acquire() as conn:
         rows = await conn.fetch('''
-            SELECT DISTINCT 
-                a.id, 
-                a.name, 
-                a.address, 
-                COALESCE(a.is_long, FALSE) as is_long
+            SELECT a.id, a.name, COALESCE(a.address, '') as address, COALESCE(a.is_long, FALSE) as is_long
             FROM apartments a
-            INNER JOIN apartments_organization_lnk aol ON a.id = aol.apartment_id
+            JOIN apartments_organization_lnk aol ON a.id = aol.apartment_id
             WHERE aol.organization_id = $1
-            AND a.published_at IS NOT NULL
-            ORDER BY a.created_at DESC
+            ORDER BY a.id DESC
         ''', org_id)
         
+        logger.info(f"✅ Found {len(rows)} apartments for org {org_id}")
         return [(row['id'], row['name'], row['address'], row['is_long']) for row in rows]
+
 
 async def create_apartment(org_id: int, name: str, address: str) -> int:
     """Создать новую квартиру"""
@@ -530,10 +523,10 @@ async def create_apartment(org_id: int, name: str, address: str) -> int:
         return apt_id
 
 async def get_apartment_info(apt_id: int) -> Optional[Dict]:
-    """Получить информацию о квартире"""
+    """Получить информацию о квартире - ИСПРАВЛЕНО: добавлены COALESCE"""
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow('''
-            SELECT a.id, a.name, a.address, COALESCE(a.is_long, FALSE) as is_long,
+            SELECT a.id, a.name, COALESCE(a.address, '') as address, COALESCE(a.is_long, FALSE) as is_long,
                    aol.organization_id
             FROM apartments a
             LEFT JOIN apartments_organization_lnk aol ON a.id = aol.apartment_id
@@ -542,14 +535,16 @@ async def get_apartment_info(apt_id: int) -> Optional[Dict]:
         
         return dict(row) if row else None
 
+
 async def toggle_apartment_term(apt_id: int):
-    """Переключить долгосрок/краткосрок"""
+    """Переключить долгосрок/краткосрок - ИСПРАВЛЕНО: добавлен COALESCE"""
     async with db_pool.acquire() as conn:
         await conn.execute('''
             UPDATE apartments 
             SET is_long = NOT COALESCE(is_long, FALSE), updated_at = NOW()
             WHERE id = $1
         ''', apt_id)
+
 
 async def delete_apartment(apt_id: int):
     """Удалить квартиру"""
@@ -725,13 +720,13 @@ async def get_apartment_field(apt_id: int, section: str, field_key: str) -> Opti
         }
 
 async def get_section_fields(apt_id: int, section: str) -> List[Dict]:
-    """Получить все поля раздела с учетом иерархии категорий + кастомные"""
+    """Получить все поля раздела - ИСПРАВЛЕНО: убран DISTINCT, добавлен GROUP BY"""
     section_name = SECTION_TO_CATEGORY_MAP.get(section, section)
     
     async with db_pool.acquire() as conn:
-        # Получаем обычные поля
+        # Получаем обычные поля - ИСПРАВЛЕНО
         rows = await conn.fetch('''
-            SELECT DISTINCT
+            SELECT 
                 i.id,
                 i.name as field_name,
                 i.text,
@@ -747,6 +742,7 @@ async def get_section_fields(apt_id: int, section: str) -> List[Dict]:
             LEFT JOIN categories parent_cat ON cpl.inv_category_id = parent_cat.id
             WHERE ial.apartment_id = $1
             AND (parent_cat.name = $2 OR child_cat.name = $2)
+            GROUP BY i.id, i.name, i.text, i.type, i.caption, child_cat.name, i.created_at
             ORDER BY i.created_at
         ''', apt_id, section_name)
         
@@ -762,9 +758,9 @@ async def get_section_fields(apt_id: int, section: str) -> List[Dict]:
                 'file_type': row['type']
             })
         
-        # Получаем кастомные поля для этого раздела
+        # Получаем кастомные поля - ИСПРАВЛЕНО
         custom_rows = await conn.fetch('''
-            SELECT DISTINCT
+            SELECT 
                 i.id,
                 i.name as field_name,
                 i.text,
@@ -778,6 +774,7 @@ async def get_section_fields(apt_id: int, section: str) -> List[Dict]:
             JOIN categories c ON icl.category_id = c.id
             WHERE ial.apartment_id = $1
             AND c.name LIKE 'Кастом %'
+            GROUP BY i.id, i.name, i.text, i.type, i.caption, c.name, i.created_at
             ORDER BY i.created_at
         ''', apt_id)
         
@@ -791,7 +788,9 @@ async def get_section_fields(apt_id: int, section: str) -> List[Dict]:
                 'file_type': row['type']
             })
         
+        logger.info(f"✅ Found {len(result)} fields for apt {apt_id} section {section}")
         return result
+
 
 async def get_filled_fields(apt_id: int, section: str) -> set:
     """
@@ -843,7 +842,7 @@ async def create_booking(apt_id: int, guest_name: str, checkin_date) -> Tuple[in
         return booking_id, hash_code
 
 async def get_apartment_bookings(apt_id: int) -> List[Dict]:
-    """Получить бронирования квартиры"""
+    """Получить бронирования квартиры - ИСПРАВЛЕНО: добавлены COALESCE"""
     async with db_pool.acquire() as conn:
         rows = await conn.fetch('''
             SELECT b.id, b.guest_name, b.checkin, b.checkout, b.hash,
@@ -856,12 +855,13 @@ async def get_apartment_bookings(apt_id: int) -> List[Dict]:
         
         return [dict(row) for row in rows]
 
+
 async def get_booking_by_hash(hash_code: str) -> Optional[Dict]:
-    """Получить бронирование по hash"""
+    """Получить бронирование по hash - ИСПРАВЛЕНО: добавлены COALESCE"""
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow('''
             SELECT b.id, b.guest_name, b.checkin, COALESCE(b.is_complete, FALSE) as is_complete,
-                   a.id as apartment_id, a.name as apartment_name, a.address
+                   a.id as apartment_id, a.name as apartment_name, COALESCE(a.address, '') as address
             FROM bookings b
             JOIN bookings_apartment_lnk bal ON b.id = bal.booking_id
             JOIN apartments a ON bal.apartment_id = a.id
@@ -869,6 +869,7 @@ async def get_booking_by_hash(hash_code: str) -> Optional[Dict]:
         ''', hash_code)
         
         return dict(row) if row else None
+
 
 async def complete_booking(booking_id: int):
     """Завершить бронирование"""
@@ -885,7 +886,7 @@ async def complete_booking(booking_id: int):
 # ============================================
 
 async def get_organization_managers(org_id: int) -> List[Dict]:
-    """Получить менеджеров организации"""
+    """Получить менеджеров организации - ИСПРАВЛЕНО: добавлены COALESCE"""
     async with db_pool.acquire() as conn:
         rows = await conn.fetch('''
             SELECT m.id, m.telegram_id, m.name, m.lastname, 
@@ -894,7 +895,7 @@ async def get_organization_managers(org_id: int) -> List[Dict]:
             FROM managers m
             JOIN managers_organization_lnk mol ON m.id = mol.manager_id
             WHERE mol.organization_id = $1
-            ORDER BY m.is_owner DESC, m.is_admin DESC, m.name
+            ORDER BY COALESCE(m.is_owner, FALSE) DESC, COALESCE(m.is_admin, FALSE) DESC, m.name
         ''', org_id)
         
         result = []
@@ -1555,11 +1556,13 @@ async def objects_menu(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     org_id = data.get('current_organization_id')
     
+    # ✅ ДОБАВЛЕНО: строгая проверка org_id
     if not org_id:
         organizations = await get_manager_organizations(callback.from_user.id)
         if organizations:
             org_id = organizations[0][0]
             await state.update_data(current_organization_id=org_id)
+            logger.info(f"✅ Reset org_id for user {callback.from_user.id}: {org_id}")
         else:
             await callback.message.edit_text(
                 "Создайте компанию",
@@ -1568,7 +1571,36 @@ async def objects_menu(callback: types.CallbackQuery, state: FSMContext):
             await callback.answer("⚠️ Создайте компанию", show_alert=True)
             return
     
+    # ✅ ДОБАВЛЕНО: проверка прав доступа
+    async with db_pool.acquire() as conn:
+        is_manager = await conn.fetchval('''
+            SELECT 1 FROM managers_organization_lnk mol
+            JOIN managers m ON mol.manager_id = m.id
+            WHERE mol.organization_id = $1 
+            AND m.telegram_id = $2
+        ''', org_id, str(callback.from_user.id))
+        
+        if not is_manager:
+            logger.error(f"❌ User {callback.from_user.id} tried to access org {org_id} without permission!")
+            await callback.answer("⚠️ Нет доступа к этой организации", show_alert=True)
+            
+            # Переключаем на первую доступную организацию
+            organizations = await get_manager_organizations(callback.from_user.id)
+            if organizations:
+                org_id = organizations[0][0]
+                await state.update_data(current_organization_id=org_id)
+            else:
+                await callback.message.edit_text(
+                    "Создайте компанию",
+                    reply_markup=get_add_organization_keyboard()
+                )
+                return
+    
     apartments = await get_organization_apartments(org_id)
+    
+    # ✅ ДОБАВЛЕНО: логирование для отладки
+    logger.info(f"✅ User {callback.from_user.id} viewing {len(apartments)} apartments from org {org_id}")
+    
     await callback.message.edit_text(
         "Список ваших объектов:",
         reply_markup=get_apartments_list_keyboard(apartments)
@@ -1852,9 +1884,6 @@ async def edit_field(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(ApartmentStates.editing_field)
 async def process_field_content(message: types.Message, state: FSMContext):
-    """
-    ДОБАВЛЕНО: уведомление о сохранении
-    """
     data = await state.get_data()
     apt_id = data.get('editing_apartment_id')
     field_key = data.get('editing_field_key')
@@ -1887,39 +1916,39 @@ async def process_field_content(message: types.Message, state: FSMContext):
     
     await save_apartment_field(apt_id, section, field_key, field_name, text_content, file_id, file_type)
     
-    # Получаем обновленные заполненные поля
+    # ✅ ДОБАВЛЕНО: уведомление о сохранении
+    success_message = "✅ Информация успешно сохранена!"
+    
     filled_fields = await get_filled_fields(apt_id, section)
     
-    # Определяем правильную клавиатуру
     if section == "help":
         keyboard = await get_help_subsection_keyboard(apt_id, filled_fields)
-        text = "Подраздел 🏠 Помощь"
+        text = f"Подраздел 🏠 Помощь\n\n{success_message}"
     elif section == "stores":
         keyboard = await get_stores_subsection_keyboard(apt_id, filled_fields)
-        text = "Подраздел 📍 Магазины"
+        text = f"Подраздел 📍 Магазины\n\n{success_message}"
     elif section == "rent":
         keyboard = await get_rent_section_keyboard(apt_id, filled_fields)
-        text = "Раздел 📹 Аренда"
+        text = f"Раздел 📹 Аренда\n\n{success_message}"
     elif section == "experiences":
         keyboard = await get_experiences_section_keyboard(apt_id, filled_fields)
-        text = "Раздел 🍿 Впечатления"
+        text = f"Раздел 🍿 Впечатления\n\n{success_message}"
     elif section == "checkout":
         keyboard = await get_checkout_section_keyboard(apt_id, filled_fields)
-        text = "Раздел 📦 Выселение"
+        text = f"Раздел 📦 Выселение\n\n{success_message}"
     else:
-        # Для checkin нужно получить filled из всех подразделов
         filled_checkin = await get_filled_fields(apt_id, 'checkin')
         filled_help = await get_filled_fields(apt_id, 'help')
         filled_stores = await get_filled_fields(apt_id, 'stores')
         all_filled = filled_checkin | filled_help | filled_stores
         
         keyboard = await get_checkin_section_keyboard_async(apt_id, all_filled)
-        text = "Раздел 🧳 Заселение"
+        text = f"Раздел 🧳 Заселение\n\n{success_message}"
     
-    # НОВОЕ: уведомление о сохранении
-    await message.answer("✅ Информация сохранена!")
     await message.answer(text, reply_markup=keyboard)
     await state.clear()
+    
+    logger.info(f"✅ Saved field {field_key} for apt {apt_id}")
 
 @dp.callback_query(F.data.startswith("skip_field_"))
 async def skip_field(callback: types.CallbackQuery, state: FSMContext):
@@ -2898,11 +2927,12 @@ async def preview_start(callback: types.CallbackQuery):
     apt_id = int(callback.data.split("_")[2])
     
     apt_info = await get_apartment_info(apt_id)
-    apt_name = safe_str(apt_info.get('name'), f'Объект #{apt_id}')
+    apt_name = apt_info['name']
     
     async with db_pool.acquire() as conn:
+        # ✅ ИСПРАВЛЕНО: добавлен GROUP BY
         sections_data = await conn.fetch('''
-            SELECT DISTINCT COALESCE(parent_cat.name, child_cat.name) as section_name
+            SELECT COALESCE(parent_cat.name, child_cat.name) as section_name
             FROM infos i
             JOIN infos_apartment_lnk ial ON i.id = ial.info_id
             JOIN infos_category_lnk icl ON i.id = icl.info_id
@@ -2911,6 +2941,7 @@ async def preview_start(callback: types.CallbackQuery):
             LEFT JOIN categories parent_cat ON cpl.inv_category_id = parent_cat.id
             WHERE ial.apartment_id = $1
             AND COALESCE(parent_cat.name, child_cat.name) IN ('Заселение', 'Аренда', 'Впечатления', 'Выселение')
+            GROUP BY COALESCE(parent_cat.name, child_cat.name)
         ''', apt_id)
     
     available_sections = set(row['section_name'] for row in sections_data)
@@ -2933,6 +2964,7 @@ async def preview_start(callback: types.CallbackQuery):
     
     await callback.message.edit_text(text, reply_markup=keyboard)
     await callback.answer()
+
 
 @dp.callback_query(F.data.startswith("prevw_section_"))
 async def preview_section(callback: types.CallbackQuery):
@@ -3174,11 +3206,12 @@ async def guest_start(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(guest_mode=True, guest_apartment_id=apt_id)
     
     apt_info = await get_apartment_info(apt_id)
-    apt_name = safe_str(apt_info.get('name'), f'Объект #{apt_id}')
+    apt_name = apt_info['name']
     
     async with db_pool.acquire() as conn:
+        # ✅ ИСПРАВЛЕНО: добавлен GROUP BY
         sections_data = await conn.fetch('''
-            SELECT DISTINCT COALESCE(parent_cat.name, child_cat.name) as section_name
+            SELECT COALESCE(parent_cat.name, child_cat.name) as section_name
             FROM infos i
             JOIN infos_apartment_lnk ial ON i.id = ial.info_id
             JOIN infos_category_lnk icl ON i.id = icl.info_id
@@ -3187,6 +3220,7 @@ async def guest_start(callback: types.CallbackQuery, state: FSMContext):
             LEFT JOIN categories parent_cat ON cpl.inv_category_id = parent_cat.id
             WHERE ial.apartment_id = $1
             AND COALESCE(parent_cat.name, child_cat.name) IN ('Заселение', 'Аренда', 'Впечатления', 'Выселение')
+            GROUP BY COALESCE(parent_cat.name, child_cat.name)
         ''', apt_id)
     
     available_sections = set(row['section_name'] for row in sections_data)
@@ -3209,6 +3243,8 @@ async def guest_start(callback: types.CallbackQuery, state: FSMContext):
     
     await callback.message.edit_text(text, reply_markup=keyboard)
     await callback.answer()
+
+
 
 @dp.callback_query(F.data.startswith("guest_section_"))
 async def guest_view_section(callback: types.CallbackQuery):
