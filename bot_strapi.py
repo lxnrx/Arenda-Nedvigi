@@ -64,7 +64,6 @@ SECTION_TO_CATEGORY_MAP = {
     'stores': 'Магазины и услуги'
 }
 
-# Маппинг полей на категории
 FIELD_TO_CATEGORY_MAP = {
     'checkin_time': 'Время заселения',
     'parking': 'Парковка',
@@ -100,6 +99,10 @@ FIELD_TO_CATEGORY_MAP = {
     'extend_stay': 'Продление',
     'discounts': 'Скидки'
 }
+
+# ✅ ДОБАВЬТЕ ЭТУ СТРОКУ СРАЗУ ПОСЛЕ FIELD_TO_CATEGORY_MAP:
+# Обратный маппинг: из названия категории получаем field_key
+CATEGORY_TO_FIELD_MAP = {v: k for k, v in FIELD_TO_CATEGORY_MAP.items()}
 
 # Иконки для UI
 FIELD_NAMES = {
@@ -720,11 +723,11 @@ async def get_apartment_field(apt_id: int, section: str, field_key: str) -> Opti
         }
 
 async def get_section_fields(apt_id: int, section: str) -> List[Dict]:
-    """Получить все поля раздела - ИСПРАВЛЕНО: убран DISTINCT, добавлен GROUP BY"""
+    """Получить все поля раздела - ИСПРАВЛЕНО: правильный field_key через маппинг"""
     section_name = SECTION_TO_CATEGORY_MAP.get(section, section)
     
     async with db_pool.acquire() as conn:
-        # Получаем обычные поля - ИСПРАВЛЕНО
+        # Получаем обычные поля
         rows = await conn.fetch('''
             SELECT 
                 i.id,
@@ -748,7 +751,13 @@ async def get_section_fields(apt_id: int, section: str) -> List[Dict]:
         
         result = []
         for row in rows:
-            field_key = row['category_name'].lower().replace(' ', '_').replace('ё', 'е')
+            category_name = row['category_name']
+            
+            # ✅ ИСПРАВЛЕНИЕ: Используем обратный маппинг для получения правильного field_key
+            field_key = CATEGORY_TO_FIELD_MAP.get(
+                category_name,
+                category_name.lower().replace(' ', '_').replace('ё', 'е')
+            )
             
             result.append({
                 'field_key': field_key,
@@ -758,7 +767,7 @@ async def get_section_fields(apt_id: int, section: str) -> List[Dict]:
                 'file_type': row['type']
             })
         
-        # Получаем кастомные поля - ИСПРАВЛЕНО
+        # Получаем кастомные поля
         custom_rows = await conn.fetch('''
             SELECT 
                 i.id,
@@ -790,6 +799,7 @@ async def get_section_fields(apt_id: int, section: str) -> List[Dict]:
         
         logger.info(f"✅ Found {len(result)} fields for apt {apt_id} section {section}")
         return result
+
 
 
 async def get_filled_fields(apt_id: int, section: str) -> set:
